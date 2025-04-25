@@ -15,7 +15,10 @@ dependencies = [
     "pytz",
     "matplotlib",
     "pytest",
-    "python-dotenv"
+    "python-dotenv",
+    "xgboost>=1.5.0",
+    "joblib>=1.1.0",
+    "scikit-learn>=1.0.0"
 ]
 
 [build-system]

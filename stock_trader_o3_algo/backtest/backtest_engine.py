@@ -9,8 +9,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from stock_trader_o3_algo.config.settings import (
-    RISK_ON, RISK_OFF, HEDGE_ETF, CASH_ETF,
-    BACKTEST_RESULTS_DIR, LOOKBACK_DAYS, VOL_LOOK
+    RISK_ON, RISK_OFF, HEDGE_ETF, CASH_ETF, BOND_ETF,
+    LOOKBACK_DAYS, VOL_LOOK, BACKTEST_RESULTS_DIR
 )
 from stock_trader_o3_algo.core.strategy import get_portfolio_allocation
 from stock_trader_o3_algo.data.price_data import fetch_prices
@@ -56,14 +56,22 @@ class BacktestEngine:
         self.portfolio_stats = None
         
         # Fetch price data with extra history for calculations
-        self.tickers = [RISK_ON, RISK_OFF, HEDGE_ETF, CASH_ETF]
+        self.tickers = [RISK_ON, RISK_OFF, BOND_ETF, HEDGE_ETF, CASH_ETF]
         
         # Calculate how many days of extra history we need for calculations
         # We need at least LOOKBACK_DAYS for momentum and VOL_LOOK for volatility
         required_history_days = max(LOOKBACK_DAYS, VOL_LOOK) + 20  # Add extra buffer
         
-        # Fetch data with enough history before start_date
-        self.prices = fetch_prices(self.tickers, days=260*2, end_date=self.end_date)
+        # Determine required start date for fetching data (include extra buffer)
+        history_start_date = (self.start_date - pd.Timedelta(days=required_history_days)).strftime("%Y-%m-%d")
+
+        # Fetch data from the calculated start date to end date
+        self.prices = fetch_prices(
+            self.tickers,
+            start_date=history_start_date,
+            end_date=self.end_date,
+            use_cache=True,
+        )
         
         # Store the full price history for calculations
         self.full_prices = self.prices.copy()
@@ -275,8 +283,8 @@ class BacktestEngine:
         ulcer_index = np.sqrt(squared_drawdowns.mean())
         
         # Calculate win/loss metrics
-        win_months = len(returns.resample('M').sum()[returns.resample('M').sum() > 0])
-        loss_months = len(returns.resample('M').sum()[returns.resample('M').sum() <= 0])
+        win_months = len(returns.resample('ME').sum()[returns.resample('ME').sum() > 0])
+        loss_months = len(returns.resample('ME').sum()[returns.resample('ME').sum() <= 0])
         total_months = win_months + loss_months
         win_rate = win_months / total_months if total_months > 0 else 0
         
@@ -351,7 +359,7 @@ class BacktestEngine:
             plt.tight_layout()
             plt.show()
     
-    def plot_asset_allocation(self, freq: str = 'M', save_path: Optional[str] = None) -> None:
+    def plot_asset_allocation(self, freq: str = 'ME', save_path: Optional[str] = None) -> None:
         """
         Plot the asset allocation over time.
         

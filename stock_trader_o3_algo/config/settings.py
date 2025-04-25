@@ -1,43 +1,46 @@
 """
-Configuration settings for the micro-CTA strategy.
+Configuration settings for the ensemble micro-trend strategy.
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# API configuration
+# API credentials
 API_KEY = os.getenv("ALPACA_KEY")
 API_SECRET = os.getenv("ALPACA_SECRET")
 BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 
 # ETF tickers
-RISK_ON = "QQQ"       # Nasdaq 100 ETF
-RISK_OFF = "GLD"      # Gold ETF (best performing 2022-2024)
-HEDGE_ETF = "SH"      # Short S&P 500 ETF
+RISK_ON = "QQQ"       # Nasdaq 100 ETF - primary investment
+RISK_OFF = "SPY"      # S&P 500 ETF (more conservative)
+BOND_ETF = "TLT"      # 20-year Treasury Bond ETF
+HEDGE_ETF = "SQQQ"    # 3x inverse QQQ ETF (for crash protection)
 CASH_ETF = "BIL"      # Treasury Bills ETF
 
-# Additional ETFs for multi-asset strategy
-QQQ_ETF = "QQQ"
-XLK_ETF = "XLK"
-GOLD_ETF = "GLD"
+# Voting system parameters
+LOOKBACK_DAYS = [63, 126, 252]  # 3, 6, 12 months lookback periods for voting
 
-# Algorithm parameters
-LOOKBACK_DAYS = 30     # Longer lookback for more reliable momentum signals
-SHORT_LOOKBACK = 10    # Longer short-term window to filter out noise
-VOL_LOOK = 20          # Lookback period for volatility calculation
-WEEKLY_VOL_TARGET = 0.03  # Higher volatility target (3%) for more aggressive positioning
-CRASH_THRESHOLD = -0.05  # Threshold for crash detection
-HEDGE_WEIGHT = 0.15    # Weight of the hedge asset during crash
-KILL_DD = 0.2          # Drawdown to trigger kill switch
+# Volatility targeting
+TARGET_VOL = 0.18     # Annual volatility target (18%)
+VOL_WINDOW = 20       # Window for volatility calculation
+
+# Crash protection
+CRASH_VIX_THRESHOLD = 25.0     # VIX threshold for crash protection
+CRASH_DROP_THRESHOLD = -0.05   # Weekly return threshold for crash protection
+HEDGE_WEIGHT = 0.10            # Allocation to hedge asset during crashes
+
+# Trading restrictions
+MIN_HOLD_DAYS = 10    # Minimum holding period for any position (trading days)
+
+# Risk management
+KILL_DD = 0.20        # Maximum drawdown before stop-loss (20%)
+COOLDOWN_WEEKS = 4    # Weeks to remain in cash after stop-loss
+
+# History requirements
 HISTORY_DAYS = 260     # Days of history to fetch for calculations
-
-# Signal Thresholds
-RSI_OVERSOLD = 30      # RSI oversold threshold (more aggressive entry)
-RSI_OVERBOUGHT = 70    # RSI overbought threshold (allow more upside)
-FAST_SMA = 10          # Fast simple moving average days
-SLOW_SMA = 30          # Slow simple moving average days
 
 # File storage for backtesting
 BACKTEST_RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "backtest_results")
