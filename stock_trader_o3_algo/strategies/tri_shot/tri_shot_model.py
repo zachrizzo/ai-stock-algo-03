@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+Walk-Forward Tri-Shot Model
+
+This module implements a walk-forward validation framework for XGBoost models
+designed to predict market directional moves while avoiding overfitting.
+"""
+
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Union, Any
@@ -20,7 +28,7 @@ except ImportError:
     HAS_ML_DEPS = False
 
 # Local imports
-import tri_shot_features as tsf
+from . import tri_shot_features as tsf
 
 
 class WalkForwardModel:

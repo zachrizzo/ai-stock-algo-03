@@ -20,6 +20,7 @@ import os
 import sys
 import argparse
 import datetime as dt
+import importlib.util
 
 # Add project root to Python path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -122,18 +123,24 @@ def main():
             run_monday_strategy, run_wednesday_strategy, run_friday_strategy,
             ensure_state_dir, get_alpaca_api
         )
-        from bin.tri_shot_cli import (
-            train_model, backtest, setup_paper_trade, run_strategy
-        )
+        
+        # For commands like train and backtest, import from tri_shot_cli
+        # but don't let it affect our path
+        spec = importlib.util.spec_from_file_location("tri_shot_cli", "bin/tri_shot_cli.py")
+        tri_shot_cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tri_shot_cli)
         
         ensure_state_dir()
         
         if args.command == 'run':
-            run_strategy(force=args.force)
+            if args.force:
+                tri_shot_cli.run_strategy(force=True)
+            else:
+                tri_shot_cli.run_strategy()
         elif args.command == 'train':
-            train_model(force=args.force)
+            tri_shot_cli.train_model(force=args.force)
         elif args.command == 'backtest':
-            backtest(
+            tri_shot_cli.backtest(
                 days=args.days, 
                 plot=args.plot, 
                 initial_capital=args.capital,
@@ -144,7 +151,7 @@ def main():
                 mc_runs=args.mc_runs
             )
         elif args.command == 'paper':
-            setup_paper_trade(
+            tri_shot_cli.setup_paper_trade(
                 initial_capital=args.capital,
                 days=args.days
             )
@@ -166,19 +173,22 @@ def main():
             print("DMT strategy requires PyTorch. Please install with: pip install torch")
             return
             
+        # Import tri_shot_cli for the DMT functions
+        spec = importlib.util.spec_from_file_location("tri_shot_cli", "bin/tri_shot_cli.py")
+        tri_shot_cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tri_shot_cli)
+        
         if args.command == 'train':
-            from bin.tri_shot_cli import train_model as train_tri_shot
-            
             # We need the tri_shot features for this
-            train_tri_shot(force=True)
+            tri_shot_cli.train_model(force=True)
             
             # Now train DMT model
             import pandas as pd
-            import tri_shot_features as tsf
+            from stock_trader_o3_algo.strategies.tri_shot import tri_shot_features
             
             # Get data for training
             tickers = ["QQQ", "TQQQ", "SQQQ", "TMF", "TLT", "^VIX"]
-            prices = tsf.fetch_data(tickers, days=1000)
+            prices = tri_shot_features.fetch_data(tickers, days=1000)
             
             # Train model
             train_market_twin(
@@ -190,9 +200,7 @@ def main():
                 save_path=args.save_path
             )
         elif args.command == 'backtest':
-            from bin.tri_shot_cli import run_dmt_command
-            
-            # Create simulated args object
+            # Create simulated args object for run_dmt_command
             class Args:
                 pass
             
@@ -208,7 +216,7 @@ def main():
             dmt_args.epochs = 10
             dmt_args.learning_rate = 0.001
             
-            run_dmt_command(dmt_args)
+            tri_shot_cli.run_dmt_command(dmt_args)
     
     elif args.strategy == 'turbo_qt':
         from stock_trader_o3_algo.strategies.turbo_qt import (

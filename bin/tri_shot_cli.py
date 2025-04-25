@@ -10,10 +10,13 @@ from pathlib import Path
 import traceback
 import matplotlib.pyplot as plt
 
+# Add project root to Python path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # Import our modules
-import tri_shot_features as tsf
-from tri_shot_model import WalkForwardModel, load_walk_forward_model
-from tri_shot import (
+from stock_trader_o3_algo.strategies.tri_shot import tri_shot_features as tsf
+from stock_trader_o3_algo.strategies.tri_shot.tri_shot_model import WalkForwardModel, load_walk_forward_model
+from stock_trader_o3_algo.strategies.tri_shot.tri_shot import (
     STATE_DIR, MODEL_FILE, TZ,
     ensure_state_dir, get_alpaca_api,
     run_monday_strategy, run_wednesday_strategy, run_friday_strategy
@@ -22,9 +25,9 @@ from tri_shot import (
 # Import DMT modules
 try:
     import torch
-    from dmt_model import MarketTwinLSTM, train_market_twin, load_market_twin
-    from dmt_strategy import DifferentiableTriShot
-    from dmt_backtest import run_dmt_backtest
+    from stock_trader_o3_algo.strategies.dmt.dmt_model import MarketTwinLSTM, train_market_twin, load_market_twin
+    from stock_trader_o3_algo.strategies.dmt.dmt_strategy import DifferentiableTriShot
+    from stock_trader_o3_algo.strategies.dmt.dmt_backtest import run_dmt_backtest
     HAS_DMT_DEPS = True
 except ImportError:
     HAS_DMT_DEPS = False
@@ -550,7 +553,7 @@ def run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps
 
 def train_walk_forward_model(prices: pd.DataFrame, target_ticker: str = "QQQ", save_model: bool = True):
     """Train a walk-forward model with the given price data."""
-    from tri_shot_model import WalkForwardModel
+    from stock_trader_o3_algo.strategies.tri_shot.tri_shot_model import WalkForwardModel
 
     # Initialize model
     model = WalkForwardModel(STATE_DIR)
@@ -673,9 +676,9 @@ import datetime as dt
 from pathlib import Path
 
 # Import Tri-Shot modules
-from tri_shot import STATE_DIR, get_alpaca_api
-from tri_shot_model import load_walk_forward_model
-import tri_shot_features as tsf
+from stock_trader_o3_algo.strategies.tri_shot import STATE_DIR, get_alpaca_api
+from stock_trader_o3_algo.strategies.tri_shot.tri_shot_model import load_walk_forward_model
+import stock_trader_o3_algo.strategies.tri_shot.tri_shot_features as tsf
 
 def run_paper_trading():
     \"\"\"Run the Tri-Shot strategy in paper trading mode.\"\"\"
