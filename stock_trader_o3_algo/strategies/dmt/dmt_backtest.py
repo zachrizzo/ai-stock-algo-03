@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Differentiable Market Twin (DMT) Backtest - Simplified Version
+Differentiable Market Twin (DMT) Backtest
 
-This module implements a simplified differentiable backtesting functionality,
-allowing optimization of the Tri-Shot strategy through gradient descent.
+This module implements backtesting functionality for the DMT strategy.
 """
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Union, Any
 from pathlib import Path
 import os
 import datetime as dt
-import time
 
 # Local imports
-import tri_shot_features as tsf
+from .dmt_model import MarketTwinLSTM, load_market_twin
+from .dmt_strategy import DifferentiableTriShot
+from stock_trader_o3_algo.strategies.tri_shot import tri_shot_features as tsf
 
 
 class SimpleVectorizedDMT(nn.Module):
@@ -200,7 +199,7 @@ def run_dmt_backtest(prices: pd.DataFrame,
     # Create DMT strategy
     print(f"Creating and optimizing DMT strategy for {n_epochs} epochs...")
     dmt_strategy = SimpleVectorizedDMT(initial_capital=initial_capital, device=device)
-    optimizer = optim.Adam(dmt_strategy.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(dmt_strategy.parameters(), lr=learning_rate)
     
     # Lists to store training progress
     losses = []

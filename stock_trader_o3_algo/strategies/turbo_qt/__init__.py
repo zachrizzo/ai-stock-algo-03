@@ -31,6 +31,5 @@ from .turbo_qt_impl import (
 )
 
 from .turbo_qt_backtest import (
-    run_backtest,
-    run_monte_carlo
+    TurboBacktester
 )

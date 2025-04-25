@@ -67,23 +67,30 @@ STOP_FILE = DATA_DIR / "stop.txt"
 STATE_FILE = DATA_DIR / "turbo_state.json"
 
 
-def get_prices(days_back: int = 400) -> pd.DataFrame:
+def get_prices(days_back: int = 400, start=None, end=None, tickers=None) -> pd.DataFrame:
     """
     Fetch price data for all required tickers.
     
     Args:
         days_back: Number of calendar days of history to fetch
+        start: Optional start date (datetime or string)
+        end: Optional end date (datetime or string)
+        tickers: Optional list of tickers to fetch (defaults to strategy tickers)
         
     Returns:
         DataFrame with closing prices for all tickers
     """
-    end = dt.datetime.now(tz=TZ)
-    start = end - dt.timedelta(days=days_back)
+    if end is None:
+        end = dt.datetime.now(tz=TZ)
     
-    tickers = [
-        TICKERS["SRC"], "TLT", TICKERS["UP"], TICKERS["DN"], 
-        TICKERS["BOND"], TICKERS["CASH"], TICKERS["VIX"]
-    ]
+    if start is None:
+        start = end - dt.timedelta(days=days_back)
+    
+    if tickers is None:
+        tickers = [
+            TICKERS["SRC"], "TLT", TICKERS["UP"], TICKERS["DN"], 
+            TICKERS["BOND"], TICKERS["CASH"], TICKERS["VIX"]
+        ]
     
     print(f"Fetching price data for {tickers}")
     df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)

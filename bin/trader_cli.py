@@ -21,6 +21,9 @@ import sys
 import argparse
 import datetime as dt
 
+# Add project root to Python path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 def setup_tri_shot_parser(subparsers):
     """Set up parser for tri_shot strategy commands."""
     parser = subparsers.add_parser('tri_shot', help='Run Tri-Shot trading strategy')
@@ -198,32 +201,38 @@ def main():
             dmt_args.initial_capital = args.capital
             dmt_args.model_path = args.model_path
             dmt_args.plot = args.plot
+            dmt_args.cpu = True
+            dmt_args.start_date = None
+            dmt_args.end_date = None
+            dmt_args.n_epochs = 10
+            dmt_args.epochs = 10
+            dmt_args.learning_rate = 0.001
             
             run_dmt_command(dmt_args)
     
     elif args.strategy == 'turbo_qt':
         from stock_trader_o3_algo.strategies.turbo_qt import (
-            rebalance, check_stops
+            rebalance, check_stops, TurboBacktester
         )
-        import turbo_qt_backtest  # This still needs to be moved and properly imported
         
         if args.command == 'rebalance':
             rebalance(dry_run=args.dry_run)
         elif args.command == 'check_stops':
             check_stops(dry_run=args.dry_run)
         elif args.command == 'backtest':
-            turbo_qt_backtest.run_backtest(
-                days=args.days,
+            # Create and run backtester
+            backtester = TurboBacktester(
+                start_date="2024-01-01",  # Use a recent date
+                end_date=dt.datetime.now().strftime('%Y-%m-%d'),
                 initial_capital=args.capital,
-                plot=args.plot
+                trading_days="mon"
             )
             
-            if args.monte_carlo:
-                turbo_qt_backtest.run_monte_carlo(
-                    days=args.days,
-                    initial_capital=args.capital,
-                    num_runs=args.mc_runs
-                )
+            backtester.run_backtest()
+            backtester.print_results()
+            
+            if args.plot:
+                backtester.plot_results()
         else:
             print("Please specify a command for turbo_qt strategy")
     

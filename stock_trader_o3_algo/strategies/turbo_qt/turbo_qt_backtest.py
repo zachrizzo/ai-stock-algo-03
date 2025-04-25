@@ -1,26 +1,27 @@
 #!/usr/bin/env python
 """
-Backtesting module for Turbo-Rotational "QQQ Turbo-4" Strategy
+Backtesting framework for the Turbo-Rotational QQQ strategy.
 
-This module performs historical backtesting of the Turbo-4 strategy to evaluate:
-- Historical performance (CAGR, drawdown, etc.)
-- Trading frequency
-- Performance during different market regimes
-- Effectiveness of crash protection mechanisms
+This module implements a comprehensive backtest for the Turbo QT strategy,
+including:
+- Monte Carlo simulation with randomized start dates
+- Transaction costs and slippage
+- Detailed performance metrics
 """
 
-import os
-import datetime as dt
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-import yfinance as yf
+import datetime as dt
+import pytz
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import os
+from typing import Dict, List, Tuple, Optional
 
-from turbo_qt import (
-    TICKERS, VOL_TARGET, ATR_MULT, HEDGE_WEIGHT, KILL_DD, COOLDOWN_WEEKS,
-    MOM_DAYS, BOND_DAYS, VIX_THRESHOLD, CRASH_THRESHOLD, TZ
+from .turbo_qt import (
+    get_prices, choose_asset, calculate_atr, check_crash_conditions,
+    TICKERS, VOL_TARGET, ATR_MULT, TZ, MOM_DAYS, BOND_DAYS, 
+    VIX_THRESHOLD, CRASH_THRESHOLD, HEDGE_WEIGHT, KILL_DD, COOLDOWN_WEEKS
 )
 
 
@@ -78,7 +79,7 @@ class TurboBacktester:
         print(f"Loading historical data for {tickers} from {buffer_start} to {self.end_date}")
         
         # Download data
-        df = yf.download(tickers, start=buffer_start, end=self.end_date, auto_adjust=True, progress=False)
+        df = get_prices(tickers, start=buffer_start, end=self.end_date)
         
         # Get closing prices
         if "Close" in df.columns:

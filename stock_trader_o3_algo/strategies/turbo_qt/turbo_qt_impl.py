@@ -15,7 +15,7 @@ import pytz
 import pandas as pd
 import numpy as np
 
-from turbo_qt import (
+from .turbo_qt import (
     get_prices, choose_asset, calculate_atr, check_crash_conditions,
     save_stop_price, check_stop_hit, get_alpaca_api,
     TICKERS, VOL_TARGET, ATR_MULT, HEDGE_WEIGHT, KILL_DD, COOLDOWN_WEEKS,

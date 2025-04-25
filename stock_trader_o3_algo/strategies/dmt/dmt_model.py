@@ -21,7 +21,7 @@ import os
 import datetime as dt
 
 # Local imports
-import tri_shot_features as tsf
+from stock_trader_o3_algo.strategies.tri_shot import tri_shot_features as tsf
 
 
 class SequenceDataset(torch.utils.data.Dataset):

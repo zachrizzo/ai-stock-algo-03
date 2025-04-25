@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Union
 
 # Import our feature engineering and model modules
-import tri_shot_features as tsf
-from tri_shot_model import WalkForwardModel, load_walk_forward_model
+from . import tri_shot_features as tsf
+from .tri_shot_model import WalkForwardModel, load_walk_forward_model
 
 # Constants
 TICKERS = {

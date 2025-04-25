@@ -2,9 +2,8 @@
 """
 Differentiable Market Twin (DMT) Strategy
 
-This module implements a differentiable version of the Tri-Shot strategy,
-allowing for gradient-based optimization of strategy parameters through
-backpropagation with the Market Twin model.
+This module implements a differentiable trading strategy that can be
+optimized through backpropagation using the DMT model.
 """
 
 import numpy as np
@@ -19,7 +18,7 @@ import os
 import datetime as dt
 
 # Local imports
-from dmt_model import MarketTwinLSTM, GumbelSoftmax
+from .dmt_model import MarketTwinLSTM, GumbelSoftmax
 
 
 class DifferentiableTriShot(nn.Module):
