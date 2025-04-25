@@ -49,9 +49,33 @@ def train_model(force=False):
     tsf.save_model(model, MODEL_FILE)
     print("Model training complete!")
 
-def backtest(days=365, plot=False, initial_capital=500.0):
-    """Run a comprehensive backtest on historical data with realistic execution."""
-    print(f"Running enhanced backtest over the last {days} days with ${initial_capital:.2f} initial capital...")
+def backtest(days=365, plot=False, initial_capital=500.0, start_date=None, slippage_bps=1, commission_bps=1, monte_carlo=False, mc_runs=10):
+    """Run a comprehensive backtest on historical data with realistic execution.
+    
+    Args:
+        days: Number of days to backtest (if start_date is None)
+        plot: Whether to plot results
+        initial_capital: Starting capital amount
+        start_date: Optional specific start date (format: 'YYYY-MM-DD')
+        slippage_bps: Slippage in basis points per side (1 bps = 0.01%)
+        commission_bps: Commission in basis points per side
+        monte_carlo: Whether to run Monte Carlo with randomized start dates
+        mc_runs: Number of Monte Carlo runs if monte_carlo=True
+    """
+    if monte_carlo:
+        return run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps, mc_runs)
+    
+    # Convert transaction costs to decimal
+    slippage = slippage_bps / 10000  # Convert bps to decimal
+    commission = commission_bps / 10000  # Convert bps to decimal
+    total_cost_per_side = slippage + commission
+    
+    if start_date:
+        print(f"Running enhanced backtest from {start_date} with ${initial_capital:.2f} initial capital...")
+        print(f"Including slippage ({slippage_bps} bps) and commission ({commission_bps} bps) per side...")
+    else:
+        print(f"Running enhanced backtest over the last {days} days with ${initial_capital:.2f} initial capital...")
+        print(f"Including slippage ({slippage_bps} bps) and commission ({commission_bps} bps) per side...")
 
     # Define tickers
     TICKERS = {
@@ -73,11 +97,17 @@ def backtest(days=365, plot=False, initial_capital=500.0):
             tickers.append(ticker)
 
     print("Fetching historical data...")
-    prices = tsf.fetch_data(tickers, days=lookback_window)
+    if start_date:
+        # Convert start_date string to datetime
+        start_dt = dt.datetime.strptime(start_date, '%Y-%m-%d')
+        # Get data from start_date to present
+        prices = tsf.fetch_data_from_date(tickers, start_date=start_dt)
+    else:
+        prices = tsf.fetch_data(tickers, days=lookback_window)
 
     # Train walk-forward model or load existing one
     model_file = STATE_DIR / "tri_shot_ensemble.pkl"
-    if model_file.exists() and days <= 400:  # Use existing model for short backtests
+    if model_file.exists() and days <= 400 and not start_date:  # Use existing model for short backtests
         print("Loading existing model...")
         model = load_walk_forward_model(STATE_DIR)
         if model is None:  # Fall back to training if loading fails
@@ -187,27 +217,28 @@ def backtest(days=365, plot=False, initial_capital=500.0):
                 results.loc[mask & medium_conviction, f'{ticker}_weight'] = 0.8  # 80% of account
                 results.loc[mask & ~(high_conviction | medium_conviction), f'{ticker}_weight'] = 0.6  # 60% of account
             else:  # Larger account
-                results.loc[mask, f'{ticker}_weight'] = 0.5  # More conservative
+                # Scale down position sizes for larger accounts
+                if initial_capital <= 10000:
+                    results.loc[mask, f'{ticker}_weight'] = 0.5  # 50% for medium accounts
+                else:
+                    results.loc[mask, f'{ticker}_weight'] = 0.3  # 30% for large accounts
     
     # Apply weights to calculate returns
     results['position_weight'] = 0.0
     for ticker in ['TQQQ', 'SQQQ', 'TMF']:
         results.loc[results['position'] == ticker, 'position_weight'] = results.loc[results['position'] == ticker, f'{ticker}_weight']
     
-    # Calculate returns with transaction costs
-    TRANSACTION_COST = 0.0005  # 5bps per trade, one-way
-    
     # Calculate daily returns for each asset
     for ticker in ['QQQ', 'TQQQ', 'SQQQ', 'TMF']:
         if ticker in results.columns:
             results[f'{ticker}_return'] = results[ticker].pct_change()
     
-    # Calculate strategy returns
+    # Calculate strategy returns with explicit slippage and commission
     results['strategy_return'] = 0.0
     
     # Apply transaction costs when position changes
     results['transaction_cost'] = 0.0
-    results.loc[results['position_change'], 'transaction_cost'] = TRANSACTION_COST
+    results.loc[results['position_change'], 'transaction_cost'] = total_cost_per_side * 2  # Entry and exit costs
     
     # Calculate weighted returns
     for ticker in ['TQQQ', 'SQQQ', 'TMF']:
@@ -309,6 +340,7 @@ def backtest(days=365, plot=False, initial_capital=500.0):
     print(f"Total Trades:           {trade_count}")
     print(f"Trades per Year:        {trades_per_year:.1f}")
     print(f"Avg. Position Size:     {results[results['position'] != 'CASH']['position_weight'].mean():.2%}")
+    print(f"Transaction Costs:      {total_cost_per_side*2*100:.1f} bps per round trip")
     
     # Plot results if requested
     if plot:
@@ -391,6 +423,121 @@ def backtest(days=365, plot=False, initial_capital=500.0):
         'trades_per_year': trades_per_year
     }
 
+def run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps, num_runs=10):
+    """Run Monte Carlo backtest with randomized start dates."""
+    print(f"Running Monte Carlo backtest with {num_runs} random start dates...")
+    
+    # Get a list of dates from which to start backtests
+    end_date = dt.datetime.now()
+    start_date = end_date - dt.timedelta(days=days*2)  # Double the days to have enough range
+    
+    # Generate random dates between start_date and end_date
+    date_range = pd.date_range(start=start_date, end=end_date, freq='B')  # Business days
+    
+    if len(date_range) < num_runs:
+        print(f"Warning: Not enough trading days ({len(date_range)}) for {num_runs} runs. Using {len(date_range)} runs instead.")
+        num_runs = len(date_range)
+    
+    # Randomly select start dates
+    random_indices = np.random.choice(len(date_range), size=num_runs, replace=False)
+    start_dates = [date_range[i].strftime('%Y-%m-%d') for i in random_indices]
+    
+    # Run backtests with different start dates
+    results = []
+    for i, start_date in enumerate(start_dates):
+        print(f"\nMonte Carlo Run {i+1}/{num_runs} - Starting from {start_date}")
+        try:
+            result = backtest(
+                days=days, 
+                plot=(i == 0),  # Only plot the first run
+                initial_capital=initial_capital,
+                start_date=start_date,
+                slippage_bps=slippage_bps,
+                commission_bps=commission_bps
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"Error in run {i+1}: {e}")
+            traceback.print_exc()
+    
+    # Analyze Monte Carlo results
+    if results:
+        # Convert results to DataFrame
+        mc_df = pd.DataFrame(results)
+        
+        print("\n" + "="*50)
+        print(" "*10 + "MONTE CARLO BACKTEST SUMMARY")
+        print("="*50)
+        
+        # Calculate statistics
+        print(f"Number of successful runs: {len(results)}/{num_runs}")
+        print(f"\nCAGR:")
+        print(f"  Mean:   {mc_df['cagr'].mean():.2%}")
+        print(f"  Median: {mc_df['cagr'].median():.2%}")
+        print(f"  Min:    {mc_df['cagr'].min():.2%}")
+        print(f"  Max:    {mc_df['cagr'].max():.2%}")
+        print(f"  Std:    {mc_df['cagr'].std():.2%}")
+        
+        print(f"\nMax Drawdown:")
+        print(f"  Mean:   {mc_df['max_drawdown'].mean():.2%}")
+        print(f"  Median: {mc_df['max_drawdown'].median():.2%}")
+        print(f"  Worst:  {mc_df['max_drawdown'].min():.2%}")
+        
+        print(f"\nSharpe Ratio:")
+        print(f"  Mean:   {mc_df['sharpe'].mean():.2f}")
+        print(f"  Median: {mc_df['sharpe'].median():.2f}")
+        print(f"  Min:    {mc_df['sharpe'].min():.2f}")
+        print(f"  Max:    {mc_df['sharpe'].max():.2f}")
+        
+        print(f"\nWin Rate:")
+        print(f"  Mean:   {mc_df['win_rate'].mean():.2%}")
+        print(f"  Median: {mc_df['win_rate'].median():.2%}")
+        print(f"  Min:    {mc_df['win_rate'].min():.2%}")
+        print(f"  Max:    {mc_df['win_rate'].max():.2%}")
+        
+        # Plot distribution of key metrics
+        try:
+            plt.figure(figsize=(15, 10))
+            
+            plt.subplot(2, 2, 1)
+            plt.hist(mc_df['cagr'] * 100, bins=10, alpha=0.7)
+            plt.axvline(mc_df['cagr'].mean() * 100, color='r', linestyle='--', label=f"Mean: {mc_df['cagr'].mean():.2%}")
+            plt.title('CAGR Distribution (%)')
+            plt.legend()
+            
+            plt.subplot(2, 2, 2)
+            plt.hist(mc_df['max_drawdown'] * 100, bins=10, alpha=0.7)
+            plt.axvline(mc_df['max_drawdown'].mean() * 100, color='r', linestyle='--', label=f"Mean: {mc_df['max_drawdown'].mean():.2%}")
+            plt.title('Max Drawdown Distribution (%)')
+            plt.legend()
+            
+            plt.subplot(2, 2, 3)
+            plt.hist(mc_df['sharpe'], bins=10, alpha=0.7)
+            plt.axvline(mc_df['sharpe'].mean(), color='r', linestyle='--', label=f"Mean: {mc_df['sharpe'].mean():.2f}")
+            plt.title('Sharpe Ratio Distribution')
+            plt.legend()
+            
+            plt.subplot(2, 2, 4)
+            plt.hist(mc_df['win_rate'] * 100, bins=10, alpha=0.7)
+            plt.axvline(mc_df['win_rate'].mean() * 100, color='r', linestyle='--', label=f"Mean: {mc_df['win_rate'].mean():.2%}")
+            plt.title('Win Rate Distribution (%)')
+            plt.legend()
+            
+            plt.tight_layout()
+            
+            # Save plot
+            plot_file = STATE_DIR / 'monte_carlo_results.png'
+            plt.savefig(plot_file)
+            print(f"Monte Carlo distribution plot saved to {plot_file}")
+            
+        except Exception as e:
+            print(f"Error generating Monte Carlo plots: {e}")
+        
+        return mc_df
+    else:
+        print("No successful Monte Carlo runs to analyze.")
+        return None
+
 def train_walk_forward_model(prices: pd.DataFrame, target_ticker: str = "QQQ", save_model: bool = True):
     """Train a walk-forward model with the given price data."""
     from tri_shot_model import WalkForwardModel
@@ -442,6 +589,211 @@ def run_strategy(force=False):
             print(f"No scheduled strategy for day {day_of_week} at time {current_time}")
             print("Use --force to run the strategy anyway")
 
+def setup_paper_trade(initial_capital=500.0, days=30):
+    """
+    Set up paper trading for the Tri-Shot strategy on Alpaca.
+    
+    Args:
+        initial_capital: Initial capital for paper trading
+        days: Number of days to run the paper trading simulation
+    """
+    import json
+    
+    # Check if Alpaca API keys are set
+    api_key = os.environ.get('ALPACA_API_KEY')
+    api_secret = os.environ.get('ALPACA_API_SECRET')
+    
+    if not api_key or not api_secret:
+        print("ERROR: Alpaca API keys not found in environment variables.")
+        print("Please set ALPACA_API_KEY and ALPACA_API_SECRET environment variables.")
+        return
+    
+    # Initialize Alpaca API client (paper trading)
+    api = get_alpaca_api(paper=True)
+    
+    # Check if account exists and is set up for paper trading
+    try:
+        account = api.get_account()
+        print(f"Connected to Alpaca paper trading account: {account.id}")
+        print(f"Current account status: {account.status}")
+        
+        # Check if account needs to be reset to initial capital
+        current_equity = float(account.equity)
+        print(f"Current paper account equity: ${current_equity:.2f}")
+        
+        if abs(current_equity - initial_capital) > 1.0:
+            print(f"WARNING: Paper account equity (${current_equity:.2f}) differs from desired initial capital (${initial_capital:.2f}).")
+            print("Consider resetting your paper account in the Alpaca dashboard to match your desired initial capital.")
+    
+    except Exception as e:
+        print(f"Error connecting to Alpaca: {e}")
+        return
+    
+    # Set up the paper trading configuration
+    end_date = dt.datetime.now() + dt.timedelta(days=days)
+    
+    # Create paper trading configuration file
+    config = {
+        "strategy": "tri_shot",
+        "initial_capital": initial_capital,
+        "start_date": dt.datetime.now().strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "max_position_size": 1.0,  # 100% of account for small accounts
+        "slippage_model": "realistic",  # Use realistic slippage model
+        "pdt_rule_enforced": True,  # Enforce Pattern Day Trading rule
+        "paper_trading": True
+    }
+    
+    # Save configuration
+    config_file = STATE_DIR / "paper_trading_config.json"
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=4)
+    
+    print(f"\nPaper trading configuration saved to {config_file}")
+    print(f"Paper trading will run until {end_date.strftime('%Y-%m-%d')}")
+    print("\nTo start paper trading, run:")
+    print("python tri_shot_cli.py run --paper")
+    
+    # Create a sample paper trading script
+    paper_script = """#!/usr/bin/env python3
+import os
+import json
+import time
+import datetime as dt
+from pathlib import Path
+
+# Import Tri-Shot modules
+from tri_shot import STATE_DIR, get_alpaca_api
+from tri_shot_model import load_walk_forward_model
+import tri_shot_features as tsf
+
+def run_paper_trading():
+    \"\"\"Run the Tri-Shot strategy in paper trading mode.\"\"\"
+    # Load configuration
+    config_file = STATE_DIR / "paper_trading_config.json"
+    with open(config_file, "r") as f:
+        config = json.load(f)
+    
+    # Initialize Alpaca API
+    api = get_alpaca_api(paper=True)
+    
+    # Load the model
+    model = load_walk_forward_model(STATE_DIR)
+    if model is None:
+        print("ERROR: Failed to load model. Please train the model first.")
+        return
+    
+    # Check if market is open
+    clock = api.get_clock()
+    if not clock.is_open:
+        next_open = clock.next_open.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"Market is closed. Next market open: {next_open}")
+        return
+    
+    # Get current positions
+    positions = api.list_positions()
+    current_position = None
+    if positions:
+        current_position = positions[0].symbol
+        print(f"Current position: {current_position} ({positions[0].qty} shares)")
+    else:
+        print("No current positions")
+    
+    # Get account info
+    account = api.get_account()
+    buying_power = float(account.buying_power)
+    print(f"Account buying power: ${buying_power:.2f}")
+    
+    # Check PDT rule
+    day_trades = int(account.daytrade_count)
+    print(f"Day trades in last 5 days: {day_trades}/3")
+    
+    # Get market data for prediction
+    tickers = ['QQQ', 'TQQQ', 'SQQQ', 'TMF', 'TLT', '^VIX']
+    prices = tsf.fetch_data(tickers, days=30)
+    
+    # Generate features and prediction
+    X, _ = tsf.make_feature_matrix(prices)
+    probability = model.predict(X.iloc[-1:]).item()
+    signal_strength = abs(probability - 0.5) / 0.5
+    
+    # Get market regime
+    bull_market = prices['QQQ'].iloc[-1] > prices['QQQ'].rolling(200).mean().iloc[-1]
+    price_momentum = prices['QQQ'].pct_change(5).iloc[-1]
+    
+    # Determine position
+    new_position = 'CASH'
+    
+    # Long condition
+    if probability >= 0.52 and price_momentum > 0:
+        new_position = 'TQQQ'
+    # Short condition
+    elif probability <= 0.48 and price_momentum < 0:
+        new_position = 'SQQQ'
+    # Bond condition
+    elif 0.48 < probability < 0.52 and prices['TLT'].pct_change(20).iloc[-1] > 0.01:
+        new_position = 'TMF'
+    
+    print(f"Model probability: {probability:.4f} (signal strength: {signal_strength:.2f})")
+    print(f"Market regime: {'Bullish' if bull_market else 'Bearish'}")
+    print(f"Price momentum: {price_momentum:.2%}")
+    print(f"Recommended position: {new_position}")
+    
+    # Check if we need to change position
+    if new_position != current_position:
+        # Check PDT rule
+        if day_trades >= 3 and current_position is not None:
+            print("WARNING: Day trade limit reached. Cannot change position.")
+            return
+        
+        # Close current position if any
+        if current_position:
+            print(f"Closing position: {current_position}")
+            api.close_position(current_position)
+        
+        # Open new position if not CASH
+        if new_position != 'CASH' and buying_power > 0:
+            # Calculate position size
+            position_size = 1.0  # 100% for small accounts
+            if signal_strength > 0.25:
+                position_size = 1.0  # Full account for high conviction
+            elif signal_strength > 0.15:
+                position_size = 0.8  # 80% for medium conviction
+            else:
+                position_size = 0.6  # 60% for lower conviction
+            
+            # Calculate dollar amount
+            amount = buying_power * position_size
+            
+            print(f"Opening position: {new_position} (${amount:.2f}, {position_size*100:.0f}% of account)")
+            api.submit_order(
+                symbol=new_position,
+                qty=None,
+                notional=amount,
+                side='buy',
+                type='market',
+                time_in_force='day'
+            )
+    else:
+        print("No position change needed")
+    
+    print("Paper trading execution complete")
+
+if __name__ == "__main__":
+    run_paper_trading()
+"""
+    
+    # Save the paper trading script
+    script_file = STATE_DIR / "run_paper_trading.py"
+    with open(script_file, "w") as f:
+        f.write(paper_script)
+    
+    print(f"\nPaper trading script created at {script_file}")
+    print("You can also run this script directly with:")
+    print(f"python {script_file}")
+    
+    return config
+
 def main():
     """Parse arguments and run the appropriate command."""
     parser = argparse.ArgumentParser(description='Tri-Shot Strategy CLI')
@@ -454,12 +806,23 @@ def main():
     # Run strategy command
     run_parser = subparsers.add_parser('run', help='Run the tri-shot strategy')
     run_parser.add_argument('--force', action='store_true', help='Force strategy execution regardless of day/time')
+    run_parser.add_argument('--paper', action='store_true', help='Run in paper trading mode')
 
     # Backtest command
     backtest_parser = subparsers.add_parser('backtest', help='Run a backtest on historical data')
     backtest_parser.add_argument('--days', type=int, default=365, help='Number of days to backtest')
     backtest_parser.add_argument('--plot', action='store_true', help='Generate plots of backtest results')
     backtest_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital for backtest')
+    backtest_parser.add_argument('--start_date', type=str, default=None, help='Optional specific start date (YYYY-MM-DD)')
+    backtest_parser.add_argument('--slippage_bps', type=float, default=1, help='Slippage in basis points per side')
+    backtest_parser.add_argument('--commission_bps', type=float, default=1, help='Commission in basis points per side')
+    backtest_parser.add_argument('--monte_carlo', action='store_true', help='Run Monte Carlo with randomized start dates')
+    backtest_parser.add_argument('--mc_runs', type=int, default=10, help='Number of Monte Carlo runs')
+
+    # Paper trading command
+    paper_parser = subparsers.add_parser('paper', help='Set up paper trading on Alpaca')
+    paper_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital for paper trading')
+    paper_parser.add_argument('--days', type=int, default=30, help='Number of days to run the paper trading simulation')
 
     args = parser.parse_args()
 
@@ -470,9 +833,24 @@ def main():
         if args.command == 'train':
             train_model(args.force)
         elif args.command == 'run':
-            run_strategy(args.force)
+            if args.paper:
+                print("Running in paper trading mode...")
+                setup_paper_trade()
+            else:
+                run_strategy(args.force)
         elif args.command == 'backtest':
-            backtest(args.days, args.plot, args.initial_capital)
+            backtest(
+                days=args.days, 
+                plot=args.plot, 
+                initial_capital=args.initial_capital, 
+                start_date=args.start_date, 
+                slippage_bps=args.slippage_bps, 
+                commission_bps=args.commission_bps, 
+                monte_carlo=args.monte_carlo, 
+                mc_runs=args.mc_runs
+            )
+        elif args.command == 'paper':
+            setup_paper_trade(args.initial_capital, args.days)
         else:
             parser.print_help()
 

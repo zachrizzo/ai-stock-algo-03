@@ -4,7 +4,8 @@ import xgboost as xgb
 import joblib
 from typing import Dict, List, Tuple, Optional, Union
 import yfinance as yf
-from datetime import datetime, timedelta
+import datetime as dt
+from datetime import timedelta
 import warnings
 
 # Suppress yfinance warnings
@@ -242,6 +243,57 @@ def fetch_data(tickers: List[str], days: int = 300) -> pd.DataFrame:
     
     df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"].ffill()
     return df
+
+def fetch_data_from_date(tickers, start_date, end_date=None):
+    """
+    Fetch historical price data for a list of tickers from a specific start date.
+    
+    Args:
+        tickers: List of ticker symbols
+        start_date: Start date as datetime object
+        end_date: Optional end date as datetime object (defaults to today)
+        
+    Returns:
+        DataFrame with price data
+    """
+    if end_date is None:
+        end_date = dt.datetime.now()
+    
+    print(f"Fetching data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    
+    # Add a buffer for feature calculation
+    buffer_start = start_date - dt.timedelta(days=30)
+    
+    # For long-term backtests, we need to be aware that some ETFs like TQQQ didn't exist before certain dates
+    # TQQQ and SQQQ inception: Feb 2010
+    # TMF inception: April 2009
+    
+    # Use yfinance's batch download for efficiency
+    try:
+        # Download all data at once
+        data = yf.download(tickers, start=buffer_start, end=end_date, auto_adjust=True, progress=False)
+        
+        if len(data) == 0:
+            print("No data available for the specified date range")
+            return pd.DataFrame()
+        
+        # Extract the Close prices
+        if isinstance(data.columns, pd.MultiIndex):
+            df = data['Close']
+        else:
+            # If only one ticker, the result won't have MultiIndex
+            df = pd.DataFrame(data['Close'])
+            df.columns = [tickers[0]]
+        
+        # Forward fill missing values
+        df = df.ffill()
+        
+        print(f"Downloaded data shape: {df.shape}")
+        return df
+        
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
 def train_model(prices: pd.DataFrame, target_ticker: str = "QQQ") -> xgb.XGBClassifier:
     """
