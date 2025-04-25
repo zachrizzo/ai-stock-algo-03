@@ -19,12 +19,22 @@ from tri_shot import (
     run_monday_strategy, run_wednesday_strategy, run_friday_strategy
 )
 
+# Import DMT modules
+try:
+    import torch
+    from dmt_model import MarketTwinLSTM, train_market_twin, load_market_twin
+    from dmt_strategy import DifferentiableTriShot
+    from dmt_backtest import run_dmt_backtest
+    HAS_DMT_DEPS = True
+except ImportError:
+    HAS_DMT_DEPS = False
+
 def setup_environment():
     """Ensure the environment is properly set up."""
     ensure_state_dir()
 
     # Check API keys only if we're not running a backtest
-    if sys.argv[1] != "backtest":
+    if sys.argv[1] not in ["backtest", "dmt"]:
         if not os.getenv("ALPACA_KEY") or not os.getenv("ALPACA_SECRET"):
             print("ERROR: Alpaca API credentials not found in environment variables")
             print("Please set ALPACA_KEY and ALPACA_SECRET environment variables")
@@ -796,67 +806,134 @@ if __name__ == "__main__":
 
 def main():
     """Parse arguments and run the appropriate command."""
-    parser = argparse.ArgumentParser(description='Tri-Shot Strategy CLI')
+    parser = argparse.ArgumentParser(description='Tri-Shot Trading Strategy CLI')
+    
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
-
-    # Train model command
-    train_parser = subparsers.add_parser('train', help='Train the XGBoost model')
-    train_parser.add_argument('--force', action='store_true', help='Force retraining even if model exists')
-
-    # Run strategy command
-    run_parser = subparsers.add_parser('run', help='Run the tri-shot strategy')
-    run_parser.add_argument('--force', action='store_true', help='Force strategy execution regardless of day/time')
-    run_parser.add_argument('--paper', action='store_true', help='Run in paper trading mode')
-
+    
+    # Train command
+    train_parser = subparsers.add_parser('train', help='Train the model')
+    train_parser.add_argument('--force', action='store_true', help='Force retrain even if model exists')
+    
+    # Run command
+    run_parser = subparsers.add_parser('run', help='Run the strategy now')
+    run_parser.add_argument('--force', action='store_true', help='Force run even if not the right day/time')
+    
     # Backtest command
-    backtest_parser = subparsers.add_parser('backtest', help='Run a backtest on historical data')
+    backtest_parser = subparsers.add_parser('backtest', help='Run backtest')
     backtest_parser.add_argument('--days', type=int, default=365, help='Number of days to backtest')
-    backtest_parser.add_argument('--plot', action='store_true', help='Generate plots of backtest results')
-    backtest_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital for backtest')
-    backtest_parser.add_argument('--start_date', type=str, default=None, help='Optional specific start date (YYYY-MM-DD)')
-    backtest_parser.add_argument('--slippage_bps', type=float, default=1, help='Slippage in basis points per side')
-    backtest_parser.add_argument('--commission_bps', type=float, default=1, help='Commission in basis points per side')
-    backtest_parser.add_argument('--monte_carlo', action='store_true', help='Run Monte Carlo with randomized start dates')
+    backtest_parser.add_argument('--plot', action='store_true', help='Plot backtest results')
+    backtest_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital')
+    backtest_parser.add_argument('--start_date', type=str, help='Start date for backtest (YYYY-MM-DD)')
+    backtest_parser.add_argument('--slippage_bps', type=float, default=2.0, help='Slippage in basis points (bps)')
+    backtest_parser.add_argument('--commission_bps', type=float, default=1.0, help='Commission in basis points (bps)')
+    backtest_parser.add_argument('--monte_carlo', action='store_true', help='Run Monte Carlo simulation')
     backtest_parser.add_argument('--mc_runs', type=int, default=10, help='Number of Monte Carlo runs')
-
-    # Paper trading command
-    paper_parser = subparsers.add_parser('paper', help='Set up paper trading on Alpaca')
+    
+    # Paper trade command
+    paper_parser = subparsers.add_parser('paper', help='Set up paper trading')
     paper_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital for paper trading')
-    paper_parser.add_argument('--days', type=int, default=30, help='Number of days to run the paper trading simulation')
-
+    paper_parser.add_argument('--days', type=int, default=30, help='Number of days to run paper trading')
+    
+    # DMT backtest command (new)
+    if HAS_DMT_DEPS:
+        dmt_parser = subparsers.add_parser('dmt', help='Run differentiable market twin backtest')
+        dmt_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital')
+        dmt_parser.add_argument('--start_date', type=str, help='Start date for backtest (YYYY-MM-DD)')
+        dmt_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs for optimization')
+        dmt_parser.add_argument('--learning_rate', type=float, default=0.01, help='Learning rate for optimization')
+        dmt_parser.add_argument('--cpu', action='store_true', help='Force CPU computation (default uses GPU if available)')
+    
     args = parser.parse_args()
-
-    try:
-        if not setup_environment():
-            return
-
-        if args.command == 'train':
-            train_model(args.force)
-        elif args.command == 'run':
-            if args.paper:
-                print("Running in paper trading mode...")
-                setup_paper_trade()
-            else:
-                run_strategy(args.force)
-        elif args.command == 'backtest':
-            backtest(
-                days=args.days, 
+    
+    # Ensure environment is set up
+    if not setup_environment():
+        return
+    
+    # Run the appropriate command
+    if args.command == 'train':
+        train_model(force=args.force)
+    elif args.command == 'run':
+        run_strategy(force=args.force)
+    elif args.command == 'backtest':
+        backtest(days=args.days, 
                 plot=args.plot, 
-                initial_capital=args.initial_capital, 
-                start_date=args.start_date, 
-                slippage_bps=args.slippage_bps, 
-                commission_bps=args.commission_bps, 
-                monte_carlo=args.monte_carlo, 
-                mc_runs=args.mc_runs
-            )
-        elif args.command == 'paper':
-            setup_paper_trade(args.initial_capital, args.days)
-        else:
-            parser.print_help()
+                initial_capital=args.initial_capital,
+                start_date=args.start_date,
+                slippage_bps=args.slippage_bps,
+                commission_bps=args.commission_bps,
+                monte_carlo=args.monte_carlo,
+                mc_runs=args.mc_runs)
+    elif args.command == 'paper':
+        setup_paper_trade(initial_capital=args.initial_capital, days=args.days)
+    elif args.command == 'dmt' and HAS_DMT_DEPS:
+        run_dmt_command(args)
+    else:
+        parser.print_help()
 
-    except Exception as e:
-        print(f"ERROR: {e}")
-        print(traceback.format_exc())
+def run_dmt_command(args):
+    """Run the DMT backtest command."""
+    if not HAS_DMT_DEPS:
+        print("ERROR: PyTorch and other DMT dependencies not found. Install with:")
+        print("pip install torch>=2.0.0")
+        return
+        
+    print("Running Differentiable Market Twin (DMT) backtest...")
+    
+    # Set device
+    device = 'cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Define tickers
+    TICKERS = {
+        "UP": "TQQQ",    # 3x long QQQ
+        "DN": "SQQQ",    # 3x short QQQ
+        "BOND": "TMF",   # 3x long treasury
+        "CASH": "BIL",   # Short-term treasury ETF (cash equivalent)
+        "SRC": "QQQ",    # Base asset to track
+        "VIX": "^VIX"    # Volatility index
+    }
+    
+    # Fetch data
+    tickers = list(TICKERS.values())
+    additional_tickers = ['TLT', 'UUP']
+    for ticker in additional_tickers:
+        if ticker not in tickers:
+            tickers.append(ticker)
+    
+    if args.start_date:
+        # Convert start_date string to datetime
+        start_dt = dt.datetime.strptime(args.start_date, '%Y-%m-%d')
+        print(f"Fetching data from {args.start_date} to present...")
+        prices = tsf.fetch_data_from_date(tickers, start_date=start_dt)
+    else:
+        # Default to 2 years of data for DMT
+        days = 730
+        print(f"Fetching data for the last {days} days...")
+        prices = tsf.fetch_data(tickers, days=days)
+    
+    # Run the simplified DMT backtest
+    results = run_dmt_backtest(
+        prices,
+        initial_capital=args.initial_capital,
+        n_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        device=device
+    )
+    
+    print("DMT backtest complete!")
+    
+    # Optional traditional backtest for comparison 
+    if args.start_date:
+        print("\nRunning traditional backtest for comparison...")
+        backtest(
+            start_date=args.start_date,
+            initial_capital=args.initial_capital,
+            slippage_bps=2.0,
+            commission_bps=1.0,
+            plot=True
+        )
+    
+    print("\nBacktest comparison complete! Check the plots in the tri_shot_data directory.")
 
 if __name__ == '__main__':
     main()
