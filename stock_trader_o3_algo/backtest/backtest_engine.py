@@ -60,7 +60,8 @@ class BacktestEngine:
         
         # Calculate how many days of extra history we need for calculations
         # We need at least LOOKBACK_DAYS for momentum and VOL_LOOK for volatility
-        required_history_days = max(LOOKBACK_DAYS, VOL_LOOK) + 20  # Add extra buffer
+        max_lookback = max(LOOKBACK_DAYS) if isinstance(LOOKBACK_DAYS, list) else LOOKBACK_DAYS
+        required_history_days = max(max_lookback, VOL_LOOK) + 20  # Add extra buffer
         
         # Determine required start date for fetching data (include extra buffer)
         history_start_date = (self.start_date - pd.Timedelta(days=required_history_days)).strftime("%Y-%m-%d")

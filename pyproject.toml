@@ -6,7 +6,7 @@ authors = [
     {name = "User"}
 ]
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.9,<3.13"
 dependencies = [
     "pandas",
     "numpy",
@@ -18,7 +18,9 @@ dependencies = [
     "python-dotenv",
     "xgboost>=1.5.0",
     "joblib>=1.1.0",
-    "scikit-learn>=1.0.0"
+    "scikit-learn>=1.0.0",
+    "torch>=2.0.0",
+    "shap (>=0.47.2,<0.48.0)"
 ]
 
 [build-system]

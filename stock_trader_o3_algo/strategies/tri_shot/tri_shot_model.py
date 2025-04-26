@@ -190,10 +190,9 @@ class WalkForwardModel:
             # Generate predictions from base models
             base_preds = {}
             for name, model in base_models.items():
-                if self.calibrate:
-                    preds = model.predict_proba(X_test)[:, 1]
-                else:
-                    preds = model.predict_proba(X_test)[:, 1]
+                # Use robust helper to avoid IndexError when a fold contains
+                # only a single class in the training data.
+                preds = self._get_positive_proba(model, X_test)
                 base_preds[name] = preds
             
             # Store model for this fold
@@ -255,6 +254,33 @@ class WalkForwardModel:
               f"Directional={final_metrics['directional_accuracy']:.4f}")
         
         return final_metrics
+    
+    def _get_positive_proba(self, model, X: pd.DataFrame) -> np.ndarray:
+        """Return probability of class 1 ("up") in a robust way.
+
+        Some sklearn models trained on a dataset that happens to contain only
+        a single class will expose *one* probability column instead of two
+        (e.g. shape ``(n_samples, 1)``). Attempting to index ``[:, 1]`` then
+        triggers an ``IndexError``. This helper inspects the model's
+        ``classes_`` attribute when present and gracefully falls back so that
+        the caller always receives a 1-D array of probabilities for the
+        positive class.
+        """
+        proba = model.predict_proba(X)
+        # If predict_proba already returns 1-D assume it is the positive class
+        if proba.ndim == 1:
+            return proba
+        # If only one probability column is returned (n_classes == 1)
+        if proba.shape[1] == 1:
+            return proba[:, 0]
+        # Standard two-column case – identify index of class 1 if possible
+        if hasattr(model, "classes_"):
+            classes = model.classes_
+            if 1 in classes:
+                pos_idx = int(np.where(classes == 1)[0][0])
+                return proba[:, pos_idx]
+        # Fallback – take the second column
+        return proba[:, 1]
     
     def _train_xgb(self, X: pd.DataFrame, y: pd.Series) -> Any:
         """Train an XGBoost model with tuned parameters."""
@@ -329,7 +355,7 @@ class WalkForwardModel:
         for fold_name, fold_models in self.models.items():
             fold_preds = []
             for model_name, model in fold_models.items():
-                fold_preds.append(model.predict_proba(X)[:, 1])
+                fold_preds.append(self._get_positive_proba(model, X))
             # Average predictions from models in this fold
             all_fold_preds.append(np.mean(fold_preds, axis=0))
         

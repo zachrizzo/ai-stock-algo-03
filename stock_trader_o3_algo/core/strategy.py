@@ -199,7 +199,8 @@ def get_portfolio_allocation(
     
     # Calculate minimum lookback based on available data
     available_days = len(prices.loc[:date])
-    min_lookback = min(LOOKBACK_DAYS, available_days - 1) if available_days > 10 else None
+    min_lookback_days = min(LOOKBACK_DAYS) if isinstance(LOOKBACK_DAYS, list) else LOOKBACK_DAYS
+    min_lookback = min(min_lookback_days, available_days - 1) if available_days > 10 else None
     
     # Select candidate asset with adaptive lookback
     candidate = select_candidate_asset(prices, date, min_lookback)
