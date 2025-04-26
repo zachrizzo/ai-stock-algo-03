@@ -7,6 +7,7 @@ import yfinance as yf
 import datetime as dt
 from datetime import timedelta
 import warnings
+from stock_trader_o3_algo.config.settings import TZ # Import TZ from settings
 
 # Suppress yfinance warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -288,6 +289,12 @@ def fetch_data_from_date(tickers, start_date, end_date=None):
         # Forward fill missing values
         df = df.ffill()
         
+        # Make index timezone-aware using the project's timezone
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(TZ)
+        else:
+            df.index = df.index.tz_convert(TZ)
+            
         print(f"Downloaded data shape: {df.shape}")
         return df
         

@@ -1,12 +1,14 @@
 import os
 import json
 import datetime as dt
-import pytz
 import numpy as np
 import pandas as pd
 import alpaca_trade_api as tradeapi
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Union
+
+# Import config first
+from stock_trader_o3_algo.config.settings import TZ
 
 # Import our feature engineering and model modules
 from . import tri_shot_features as tsf
@@ -39,9 +41,6 @@ STOP_FILE = STATE_DIR / "stop.json"
 COOLDOWN_FILE = STATE_DIR / "cooldown.txt"
 MODEL_FILE = STATE_DIR / "model.pkl"
 EQUITY_HIGH_FILE = STATE_DIR / "equity_high.txt"
-
-# Timezone
-TZ = pytz.timezone("America/New_York")
 
 def ensure_state_dir():
     """Create the state directory if it doesn't exist."""

@@ -6,14 +6,16 @@ This is the main entry point for all trading strategies:
 - Tri-Shot (tri_shot): A strategy running on Monday/Wednesday/Friday
 - DMT (dmt): Differentiable Market Twin strategy
 - TurboQT (turbo_qt): Turbo Rotational QQQ strategy
+- Hybrid (hybrid): A hybrid strategy combining Tri-Shot, DMT, and TurboQT
 
 Usage:
   trader_cli.py [strategy] [command] [options]
 
 Examples:
   trader_cli.py tri_shot run
-  trader_cli.py dmt backtest --days 365
+  trader_cli.py dmt backtest --start-date 2022-01-01 --end-date 2022-12-31
   trader_cli.py turbo_qt rebalance
+  trader_cli.py hybrid run --capital 10000.0
 """
 
 import os
@@ -40,10 +42,10 @@ def setup_tri_shot_parser(subparsers):
     
     # Backtest
     backtest_cmd = tri_cmds.add_parser('backtest', help='Run a comprehensive backtest')
-    backtest_cmd.add_argument('--days', type=int, default=365, help='Number of days to backtest')
+    backtest_cmd.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
+    backtest_cmd.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
     backtest_cmd.add_argument('--plot', action='store_true', help='Plot results')
     backtest_cmd.add_argument('--capital', type=float, default=500.0, help='Initial capital')
-    backtest_cmd.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
     backtest_cmd.add_argument('--slippage', type=int, default=1, help='Slippage in basis points')
     backtest_cmd.add_argument('--commission', type=int, default=1, help='Commission in basis points')
     backtest_cmd.add_argument('--monte-carlo', action='store_true', help='Run Monte Carlo simulation')
@@ -68,10 +70,13 @@ def setup_dmt_parser(subparsers):
     
     # Backtest
     backtest_cmd = dmt_cmds.add_parser('backtest', help='Run DMT backtest')
-    backtest_cmd.add_argument('--days', type=int, default=365, help='Days to backtest')
+    backtest_cmd.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
+    backtest_cmd.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
     backtest_cmd.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
     backtest_cmd.add_argument('--plot', action='store_true', help='Plot results')
     backtest_cmd.add_argument('--model-path', type=str, help='Path to trained model')
+    backtest_cmd.add_argument('--epochs', type=int, default=100, help='Number of training epochs for DMT backtest (default: 100)')
+    backtest_cmd.add_argument('--learning-rate', type=float, default=0.01, help='Learning rate for DMT backtest optimization (default: 0.01)')
 
 def setup_turbo_qt_parser(subparsers):
     """Set up parser for Turbo QT strategy commands."""
@@ -88,11 +93,35 @@ def setup_turbo_qt_parser(subparsers):
     
     # Backtest
     backtest_cmd = turbo_cmds.add_parser('backtest', help='Run backtest')
-    backtest_cmd.add_argument('--days', type=int, default=365, help='Days to backtest')
+    backtest_cmd.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
+    backtest_cmd.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
     backtest_cmd.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
     backtest_cmd.add_argument('--plot', action='store_true', help='Plot results')
     backtest_cmd.add_argument('--monte-carlo', action='store_true', help='Run Monte Carlo')
     backtest_cmd.add_argument('--mc-runs', type=int, default=10, help='Number of Monte Carlo runs')
+
+def setup_hybrid_parser(subparsers):
+    """Set up parser for Hybrid strategy commands."""
+    parser = subparsers.add_parser('hybrid', help='Run Hybrid strategy (combines Tri-Shot, DMT, and TurboQT)')
+    hybrid_cmds = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Run strategy
+    run_cmd = hybrid_cmds.add_parser('run', help='Run strategy for current market conditions')
+    run_cmd.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
+    
+    # Backtest
+    backtest_cmd = hybrid_cmds.add_parser('backtest', help='Run comprehensive backtest')
+    backtest_cmd.add_argument('--days', type=int, default=365, help='Number of days to backtest')
+    backtest_cmd.add_argument('--plot', action='store_true', help='Plot results')
+    backtest_cmd.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
+    backtest_cmd.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
+    backtest_cmd.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
+    
+    # Compare strategies
+    compare_cmd = hybrid_cmds.add_parser('compare', help='Compare performance of all strategies')
+    compare_cmd.add_argument('--days', type=int, default=365, help='Number of days to compare')
+    compare_cmd.add_argument('--plot', action='store_true', help='Plot comparison results')
+    compare_cmd.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
 
 def main():
     """Main entry point for the trader CLI."""
@@ -109,6 +138,7 @@ def main():
     setup_tri_shot_parser(subparsers)
     setup_dmt_parser(subparsers)
     setup_turbo_qt_parser(subparsers)
+    setup_hybrid_parser(subparsers)
     
     args = parser.parse_args()
     
@@ -141,10 +171,10 @@ def main():
             tri_shot_cli.train_model(force=args.force)
         elif args.command == 'backtest':
             tri_shot_cli.backtest(
-                days=args.days, 
+                start_date=args.start_date, 
+                end_date=args.end_date, 
                 plot=args.plot, 
                 initial_capital=args.capital,
-                start_date=args.start_date,
                 slippage_bps=args.slippage,
                 commission_bps=args.commission,
                 monte_carlo=args.monte_carlo,
@@ -205,16 +235,14 @@ def main():
                 pass
             
             dmt_args = Args()
-            dmt_args.days = args.days
+            dmt_args.start_date = args.start_date
+            dmt_args.end_date = args.end_date
             dmt_args.initial_capital = args.capital
             dmt_args.model_path = args.model_path
             dmt_args.plot = args.plot
             dmt_args.cpu = True
-            dmt_args.start_date = None
-            dmt_args.end_date = None
-            dmt_args.n_epochs = 10
-            dmt_args.epochs = 10
-            dmt_args.learning_rate = 0.001
+            dmt_args.epochs = args.epochs
+            dmt_args.learning_rate = args.learning_rate
             
             tri_shot_cli.run_dmt_command(dmt_args)
     
@@ -230,8 +258,8 @@ def main():
         elif args.command == 'backtest':
             # Create and run backtester
             backtester = TurboBacktester(
-                start_date="2024-01-01",  # Use a recent date
-                end_date=dt.datetime.now().strftime('%Y-%m-%d'),
+                start_date=args.start_date,  
+                end_date=args.end_date,
                 initial_capital=args.capital,
                 trading_days="mon"
             )
@@ -243,6 +271,104 @@ def main():
                 backtester.plot_results()
         else:
             print("Please specify a command for turbo_qt strategy")
+            
+    elif args.strategy == 'hybrid':
+        if not args.command:
+            print("Please specify a command for hybrid strategy")
+            return
+            
+        from stock_trader_o3_algo.strategies.hybrid.hybrid_strategy import run_hybrid_strategy
+        from stock_trader_o3_algo.strategies.hybrid.hybrid_backtest import run_hybrid_backtest
+        
+        if args.command == 'run':
+            # Run hybrid strategy for current market conditions
+            allocation = run_hybrid_strategy(capital=args.capital)
+            
+            # Print allocation results
+            print("\nHybrid Strategy Allocation:")
+            for symbol, amount in allocation.items():
+                print(f"  {symbol}: ${amount:.2f} ({amount/args.capital*100:.1f}%)")
+                
+        elif args.command == 'backtest':
+            # Parse dates if provided
+            start_date = args.start_date
+            end_date = args.end_date
+            
+            # Run backtest
+            run_hybrid_backtest(
+                days=args.days,
+                plot=args.plot,
+                initial_capital=args.capital,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+        elif args.command == 'compare':
+            print("Running strategy comparison...")
+            
+            # Import necessary modules
+            import matplotlib.pyplot as plt
+            import pandas as pd
+            
+            # Run backtests for each strategy
+            print("Running tri_shot backtest...")
+            tri_shot_cli.backtest(days=args.days, plot=False, initial_capital=args.capital)
+            
+            print("Running DMT backtest...")
+            dmt_args = type('Args', (), {
+                'days': args.days,
+                'initial_capital': args.capital,
+                'plot': False,
+                'model_path': None,
+                'cpu': True,
+                'start_date': None,
+                'end_date': None,
+                'epochs': 10
+            })
+            tri_shot_cli.run_dmt_command(dmt_args)
+            
+            print("Running TurboQT backtest...")
+            turbo_backtester = TurboBacktester(
+                start_date=dt.datetime.now() - dt.timedelta(days=args.days),
+                end_date=dt.datetime.now(),
+                initial_capital=args.capital
+            )
+            turbo_backtester.run_backtest()
+            
+            print("Running Hybrid backtest...")
+            hybrid_backtester = run_hybrid_backtest(days=args.days, plot=False, initial_capital=args.capital)
+            
+            # Load backtest results
+            results_dir = os.path.join(os.path.dirname(__file__), '../tri_shot_data')
+            
+            # Read equity curves
+            tri_shot_equity = pd.read_csv(os.path.join(results_dir, 'backtest_results.csv'), index_col=0, parse_dates=True)['equity']
+            dmt_equity = pd.read_csv(os.path.join(results_dir, 'dmt_backtest_results.csv'), index_col=0, parse_dates=True)['equity']
+            hybrid_equity = pd.read_csv(os.path.join(results_dir, 'hybrid_equity_curve.csv'), index_col=0, parse_dates=True)
+            
+            # Plot comparison
+            if args.plot:
+                plt.figure(figsize=(12, 8))
+                plt.plot(tri_shot_equity, label='Tri-Shot')
+                plt.plot(dmt_equity, label='DMT')
+                plt.plot(hybrid_equity, label='Hybrid')
+                
+                # Add QQQ benchmark
+                qqq_data = hybrid_backtester.prices['QQQ']
+                qqq_equity = args.capital * (qqq_data / qqq_data.iloc[0])
+                plt.plot(qqq_equity, label='QQQ')
+                
+                plt.title('Strategy Comparison')
+                plt.ylabel('Portfolio Value ($)')
+                plt.grid(True)
+                plt.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(results_dir, 'strategy_comparison.png'))
+                
+                print(f"Comparison plot saved to {os.path.join(results_dir, 'strategy_comparison.png')}")
+        else:
+            print("Please specify a valid command for hybrid strategy")
     
 if __name__ == '__main__':
     main()

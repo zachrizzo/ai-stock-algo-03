@@ -339,6 +339,10 @@ def run_dmt_backtest(prices: pd.DataFrame,
     plt.savefig(plot_path)
     plt.close()
     
+    # Ensure the first equity value matches the initial capital exactly
+    if 'dmt_equity' in results.columns and not results.empty:
+        results['dmt_equity'].iloc[0] = initial_capital
+        
     # Save results CSV
     results_path = os.path.join(os.getcwd(), "tri_shot_data", "dmt_backtest_results.csv")
     results.to_csv(results_path, index=False)

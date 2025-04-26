@@ -4,6 +4,7 @@ Configuration settings for the ensemble micro-trend strategy.
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import pytz
 
 # Load environment variables
 load_dotenv()
@@ -59,6 +60,12 @@ COOLDOWN_WEEKS = 4    # Weeks to remain in cash after stop-loss
 
 # History requirements
 HISTORY_DAYS = 260     # Days of history to fetch for calculations
+
+# Timezone
+TZ = pytz.timezone("America/New_York")
+
+# Base directory for data/state files
+BASE_DIR = Path(__file__).resolve().parent.parent # stock_trader_o3_algo
 
 # File storage for backtesting
 BACKTEST_RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "backtest_results")

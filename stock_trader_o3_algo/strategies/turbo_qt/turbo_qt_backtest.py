@@ -68,7 +68,7 @@ class TurboBacktester:
     def _load_data(self):
         """Load historical price data for backtesting."""
         # Calculate start date with buffer for calculations
-        buffer_start = self.start_date - pd.Timedelta(days=365)  # 1 year buffer
+        buffer_start = self.start_date - pd.Timedelta(days=500)  # Increased buffer
         
         # Tickers needed for backtesting
         tickers = [
@@ -233,7 +233,6 @@ class TurboBacktester:
         cooldown_until = None
         last_trade_date = None
         min_hold_days = 5  # Set minimum hold period to 5 days
-        equity_curve = []
         all_dates = []
         trades = []
         allocations = []
@@ -243,14 +242,19 @@ class TurboBacktester:
         weekly_trade_count = {}  # Week number -> trade count
         
         # Get all trading dates in range
-        trading_dates = self.prices.loc[self.start_date:self.end_date].index
+        all_available_dates = self.prices.loc[self.start_date:self.end_date].index
         
         # Filter for specified trading days (e.g., only Mondays)
+        trading_dates = all_available_dates
         if self.trading_days in self.trading_days_map:
             allowed_days = self.trading_days_map[self.trading_days]
             trading_dates = [d for d in trading_dates if d.weekday() in allowed_days]
         
-        print(f"Total trading days: {len(trading_dates)}")
+        print(f"Total trading days considered by logic: {len(trading_dates)}")
+        print(f"Equity curve will cover {len(all_available_dates)} days from {all_available_dates[0]} to {all_available_dates[-1]}")
+
+        # Initialize equity curve list with starting capital
+        equity_curve = [self.initial_capital] * len(all_available_dates)
         
         # Position leverage multiplier (simulate leveraged ETF performance)
         leveraged_return_multiplier = {
@@ -268,289 +272,257 @@ class TurboBacktester:
             TICKERS["CASH"]: 0.0001   # 0.14% annual expense ratio
         }
         
-        # Run through each trading date
-        for i, date in enumerate(trading_dates):
-            # Track weekly trade count (for PDT rule)
-            week_num = date.isocalendar()[1]
-            year = date.year
-            week_key = f"{year}-{week_num}"
-            if week_key not in weekly_trade_count:
-                weekly_trade_count[week_key] = 0
+        # Run through each actual date in the full range
+        prev_equity = self.initial_capital # Start with initial capital
+        current_logic_asset = TICKERS["CASH"] # Asset decided by logic (might only change on Mondays)
+        current_logic_weight = 1.0
+
+        # Map logic dates to their index in the full date range for easier equity updates
+        logic_date_to_full_idx = {date: idx for idx, date in enumerate(all_available_dates)}
+        logic_dates_set = set(trading_dates) # Faster lookup
+
+        for idx, date in enumerate(all_available_dates):
+            # If it's the first day, equity is already set
+            if idx == 0:
+                all_dates.append(date)
+                continue
+
+            # Determine the asset held based on the *last logic decision date*
+            # This assumes we hold the position decided on the last Monday (or logic day)
+            # until the next logic day.
+
+            # Get daily return for the currently held asset
+            daily_return = 0.0
+            cost_deduction = 0.0
+            if current_logic_asset in self.prices.columns and date in self.prices.index and all_available_dates[idx-1] in self.prices.index:
+                prev_price = self.prices.loc[all_available_dates[idx-1], current_logic_asset]
+                current_price = self.prices.loc[date, current_logic_asset]
+                if pd.notna(prev_price) and pd.notna(current_price) and prev_price != 0:
+                    base_return = (current_price / prev_price) - 1
+                    leverage = leveraged_return_multiplier.get(current_logic_asset, 1.0)
+                    daily_return = base_return * leverage * current_logic_weight # Apply weight
+                    cost_deduction = daily_cost.get(current_logic_asset, 0.0) * current_logic_weight # Apply cost based on weight
             
-            # Update peak equity for trailing high watermark
-            peak_equity = max(peak_equity, equity)
+            # Calculate today's equity based on yesterday's equity and today's return/cost
+            today_equity = prev_equity * (1 + daily_return - cost_deduction)
             
-            # Check if we're in cooldown period
-            if in_cooldown and date <= cooldown_until:
-                current_asset = TICKERS["CASH"]
-                current_weight = 1.0
-            elif in_cooldown and date > cooldown_until:
-                in_cooldown = False
-                cooldown_until = None
-            
-            # Check stop-loss if we have one and minimum hold period passed
-            # Only check if we have trades available this week (PDT rule)
-            if (stop_price is not None and 
-                current_asset in [TICKERS["UP"], TICKERS["DN"], TICKERS["BOND"]] and
-                (last_trade_date is None or (date - last_trade_date).days >= min_hold_days) and
-                weekly_trade_count[week_key] < 3):
+            # --- Logic Execution only on trading_dates --- 
+            if date in logic_dates_set:
+                # Track weekly trade count (for PDT rule)
+                week_num = date.isocalendar()[1]
+                year = date.year
+                week_key = f"{year}-{week_num}"
+                if week_key not in weekly_trade_count:
+                    weekly_trade_count[week_key] = 0
                 
-                if self._check_stop_hit(current_asset, stop_price, date):
-                    # Stop hit - move to cash
-                    print(f"{date}: STOP HIT for {current_asset} at {stop_price:.2f}")
-                    trades.append({
-                        'date': date,
-                        'type': 'stop_loss',
-                        'asset': current_asset,
-                        'direction': 'sell',
-                        'price': self.prices.loc[date, current_asset],
-                        'equity': equity
-                    })
-                    
-                    current_asset = TICKERS["CASH"]
-                    current_weight = 1.0
-                    stop_price = None
-                    last_trade_date = date
-                    weekly_trade_count[week_key] += 1
-                    trade_dates.add(date)
-            
-            # Monday rebalancing or first day
-            # Only rebalance if we have trades available this week (PDT rule)
-            is_monday = date.weekday() == 0
-            if (i == 0 or is_monday) and weekly_trade_count[week_key] < 3:
-                # Check minimum hold period
-                min_hold_met = True
-                if last_trade_date is not None:
-                    days_since_last_trade = (date - last_trade_date).days
-                    min_hold_met = days_since_last_trade >= min_hold_days
+                # Update peak equity for trailing high watermark
+                peak_equity = max(peak_equity, today_equity) # Use today's calculated equity
                 
-                if min_hold_met and not in_cooldown:
-                    # Choose asset
-                    new_asset = self._choose_asset(date)
+                # Check if we're in cooldown period
+                if in_cooldown and date <= cooldown_until:
+                    current_logic_asset = TICKERS["CASH"]
+                    current_logic_weight = 1.0
+                elif in_cooldown and date > cooldown_until:
+                    in_cooldown = False
+                    cooldown_until = None
+                
+                # Check stop-loss if we have one and minimum hold period passed
+                if (stop_price is not None and 
+                    current_logic_asset in [TICKERS["UP"], TICKERS["DN"], TICKERS["BOND"]] and
+                    (last_trade_date is None or (date - last_trade_date).days >= min_hold_days) and
+                    weekly_trade_count[week_key] < 3):
                     
-                    # Check for crash conditions
-                    crash_conditions = self._check_crash_conditions(date)
-                    
-                    # Calculate volatility for position sizing
-                    if new_asset != TICKERS["CASH"] and new_asset in self.prices.columns:
-                        # Get data up to this date
-                        prices_subset = self.prices.loc[:date][new_asset]
-                        
-                        # Calculate volatility
-                        if len(prices_subset) > 20:
-                            # Calculate realized volatility using returns
-                            returns = prices_subset.pct_change().dropna()
-                            if len(returns) >= 20:
-                                sigma = returns.tail(20).std() * np.sqrt(252)
-                                weight = min(1.0, VOL_TARGET / sigma) if sigma > 0 else 0.5
-                            else:
-                                weight = 0.5  # Default if not enough return data
-                        else:
-                            weight = 0.5  # Conservative default
-                    else:
-                        weight = 1.0
-                    
-                    # Apply hedge if needed
-                    hedge_needed = (new_asset != TICKERS["DN"] and crash_conditions)
-                    
-                    # Adjust weight for hedge
-                    if hedge_needed:
-                        weight = weight * (1.0 - HEDGE_WEIGHT)
-                    
-                    # Calculate allocations
-                    allocations_dict = {}
-                    
-                    if new_asset != TICKERS["CASH"]:
-                        allocations_dict[new_asset] = weight
-                        
-                        if hedge_needed:
-                            allocations_dict[TICKERS["DN"]] = HEDGE_WEIGHT
-                        
-                        allocations_dict[TICKERS["CASH"]] = max(0.0, 1.0 - sum(allocations_dict.values()))
-                    else:
-                        allocations_dict[TICKERS["CASH"]] = 1.0
-                    
-                    # Record allocation
-                    allocations.append({
-                        'date': date,
-                        'allocations': allocations_dict,
-                        'equity': equity
-                    })
-                    
-                    # Record trades if asset changed
-                    trades_executed = 0
-                    if new_asset != current_asset:
-                        if current_asset != TICKERS["CASH"]:
-                            trades.append({
-                                'date': date,
-                                'type': 'rebalance',
-                                'asset': current_asset,
-                                'direction': 'sell',
-                                'price': self.prices.loc[date, current_asset],
-                                'equity': equity
-                            })
-                            trades_executed += 1
-                        
-                        if new_asset != TICKERS["CASH"]:
-                            trades.append({
-                                'date': date,
-                                'type': 'rebalance',
-                                'asset': new_asset,
-                                'direction': 'buy',
-                                'price': self.prices.loc[date, new_asset],
-                                'equity': equity
-                            })
-                            trades_executed += 1
-                    
-                    # Add hedge if needed (counts as a trade)
-                    if hedge_needed and not (current_asset == TICKERS["DN"] or current_asset == TICKERS["CASH"]):
+                    if self._check_stop_hit(current_logic_asset, stop_price, date):
+                        print(f"{date}: STOP HIT for {current_logic_asset} at {stop_price:.2f}")
                         trades.append({
                             'date': date,
-                            'type': 'hedge',
-                            'asset': TICKERS["DN"],
-                            'direction': 'buy',
-                            'price': self.prices.loc[date, TICKERS["DN"]],
-                            'equity': equity
-                        })
-                        trades_executed += 1
-                    
-                    # Update trade count for PDT rule
-                    if trades_executed > 0:
-                        weekly_trade_count[week_key] += min(trades_executed, 3)  # Cap at 3 trades per week
-                        trade_dates.add(date)
-                    
-                    # Update current position
-                    current_asset = new_asset
-                    current_weight = weight
-                    
-                    # Calculate and save stop price
-                    if current_asset in [TICKERS["UP"], TICKERS["DN"], TICKERS["BOND"]] and current_asset in self.prices.columns:
-                        # Calculate ATR
-                        atr_value = self._calculate_atr(current_asset, date)
-                        
-                        # Calculate stop price
-                        if current_asset == TICKERS["UP"] or current_asset == TICKERS["BOND"]:
-                            # For long positions, stop is below current price
-                            stop_price = self.prices.loc[date, current_asset] - (ATR_MULT * atr_value)
-                        else:
-                            # For short positions, stop is above current price
-                            stop_price = self.prices.loc[date, current_asset] + (ATR_MULT * atr_value)
-                    else:
-                        stop_price = None
-                    
-                    # Update last trade date
-                    last_trade_date = date
-            
-            # Calculate returns and update equity
-            if i < len(trading_dates) - 1:
-                next_date = trading_dates[i+1]
-                daily_return = 0.0
-                
-                # Calculate weighted return based on allocations
-                if current_asset == TICKERS["CASH"]:
-                    if TICKERS["CASH"] in self.prices.columns:
-                        daily_return = (self.prices.loc[next_date, TICKERS["CASH"]] / self.prices.loc[date, TICKERS["CASH"]] - 1)
-                        # Apply cash expense ratio
-                        daily_return -= daily_cost[TICKERS["CASH"]]
-                else:
-                    # Calculate return for main asset (apply leverage multiplier)
-                    if current_asset in self.prices.columns:
-                        asset_weight = current_weight
-                        base_asset_return = (self.prices.loc[next_date, current_asset] / self.prices.loc[date, current_asset] - 1)
-                        
-                        # Apply leverage multiplier if it's a leveraged ETF
-                        if current_asset in [TICKERS["UP"], TICKERS["DN"], TICKERS["BOND"]]:
-                            # For SQQQ (inverse ETF), returns work opposite
-                            if current_asset == TICKERS["DN"]:
-                                # For inverse ETF, we need to simulate the inverse return
-                                # Use the base QQQ return to simulate
-                                if TICKERS["SRC"] in self.prices.columns:
-                                    qqq_return = (self.prices.loc[next_date, TICKERS["SRC"]] / self.prices.loc[date, TICKERS["SRC"]] - 1)
-                                    # Negative 2.8x of QQQ return for SQQQ
-                                    asset_return = -1 * leveraged_return_multiplier[current_asset] * qqq_return
-                                else:
-                                    # If QQQ data not available, approximate
-                                    asset_return = leveraged_return_multiplier[current_asset] * base_asset_return
-                            else:
-                                # For regular leveraged ETFs
-                                asset_return = leveraged_return_multiplier[current_asset] * base_asset_return
-                        else:
-                            asset_return = base_asset_return
-                            
-                        # Apply expense ratio cost
-                        if current_asset in daily_cost:
-                            asset_return -= daily_cost[current_asset]
-                            
-                        daily_return += asset_weight * asset_return
-                    
-                    # Calculate return for hedge if active
-                    if hedge_needed and TICKERS["DN"] in self.prices.columns:
-                        # For inverse ETF hedge, use QQQ return if available
-                        if TICKERS["SRC"] in self.prices.columns:
-                            qqq_return = (self.prices.loc[next_date, TICKERS["SRC"]] / self.prices.loc[date, TICKERS["SRC"]] - 1)
-                            # Negative 2.8x of QQQ return for SQQQ hedge
-                            hedge_return = -1 * leveraged_return_multiplier[TICKERS["DN"]] * qqq_return
-                        else:
-                            base_hedge_return = (self.prices.loc[next_date, TICKERS["DN"]] / self.prices.loc[date, TICKERS["DN"]] - 1)
-                            hedge_return = leveraged_return_multiplier[TICKERS["DN"]] * base_hedge_return
-                            
-                        # Apply expense ratio cost
-                        hedge_return -= daily_cost[TICKERS["DN"]]
-                        
-                        daily_return += HEDGE_WEIGHT * hedge_return
-                    
-                    # Calculate return for cash portion
-                    cash_weight = max(0.0, 1.0 - current_weight - (HEDGE_WEIGHT if hedge_needed else 0.0))
-                    if cash_weight > 0 and TICKERS["CASH"] in self.prices.columns:
-                        cash_return = (self.prices.loc[next_date, TICKERS["CASH"]] / self.prices.loc[date, TICKERS["CASH"]] - 1)
-                        # Apply cash expense ratio
-                        cash_return -= daily_cost[TICKERS["CASH"]]
-                        daily_return += cash_weight * cash_return
-                
-                # Update equity
-                equity *= (1 + daily_return)
-                equity_curve.append(equity)
-                all_dates.append(next_date)
-                
-                # Check for kill-switch (max drawdown)
-                drawdown = (equity / peak_equity) - 1
-                if drawdown < -KILL_DD and not in_cooldown:
-                    print(f"{next_date}: KILL-SWITCH TRIGGERED: Drawdown {drawdown:.2%}")
-                    
-                    # Record trade if we have trades available this week
-                    if weekly_trade_count[week_key] < 3:
-                        trades.append({
-                            'date': next_date,
-                            'type': 'kill_switch',
-                            'asset': current_asset,
+                            'type': 'stop_loss',
+                            'asset': current_logic_asset,
                             'direction': 'sell',
-                            'price': self.prices.loc[next_date, current_asset],
-                            'equity': equity
+                            'price': self.prices.loc[date, current_logic_asset],
+                            'equity': today_equity # Use today's equity
                         })
+                        
+                        current_logic_asset = TICKERS["CASH"]
+                        current_logic_weight = 1.0
+                        stop_price = None
+                        last_trade_date = date
                         weekly_trade_count[week_key] += 1
-                        trade_dates.add(next_date)
+                        trade_dates.add(date)
+                
+                # Monday rebalancing or first logic day
+                is_monday = date.weekday() == 0 # Keep check if needed elsewhere, but logic runs now
+                if weekly_trade_count[week_key] < 3:
+                    # Check minimum hold period
+                    min_hold_met = True
+                    if last_trade_date is not None:
+                        days_since_last_trade = (date - last_trade_date).days
+                        min_hold_met = days_since_last_trade >= min_hold_days
                     
-                    # Set cooldown period
-                    in_cooldown = True
-                    cooldown_until = next_date + pd.Timedelta(weeks=COOLDOWN_WEEKS)
-                    
-                    # Move to cash
-                    current_asset = TICKERS["CASH"]
-                    current_weight = 1.0
-                    stop_price = None
+                    if min_hold_met and not in_cooldown:
+                        # Choose asset
+                        new_asset = self._choose_asset(date)
+                        
+                        # Check for crash conditions
+                        crash_conditions = self._check_crash_conditions(date)
+                        
+                        # Calculate volatility for position sizing
+                        new_weight = 1.0 # Default weight
+                        if new_asset != TICKERS["CASH"] and new_asset in self.prices.columns:
+                            prices_subset = self.prices.loc[:date][new_asset]
+                            if len(prices_subset) > 20:
+                                returns = prices_subset.pct_change().dropna()
+                                if len(returns) >= 20:
+                                    sigma = returns.tail(20).std() * np.sqrt(252)
+                                    new_weight = min(1.0, VOL_TARGET / sigma) if sigma > 0 else 0.5
+                                else:
+                                    new_weight = 0.5
+                            else:
+                                new_weight = 0.5
+                        
+                        # Apply hedge if needed
+                        hedge_needed = (new_asset != TICKERS["DN"] and crash_conditions)
+                        if hedge_needed:
+                            new_weight = new_weight * (1.0 - HEDGE_WEIGHT)
+                        
+                        # Did the asset or weight change significantly?
+                        asset_changed = (new_asset != current_logic_asset)
+                        # Check if weight changed meaningfully (e.g., > 1%)
+                        weight_changed = abs(new_weight - current_logic_weight) > 0.01 
+                        
+                        if asset_changed or weight_changed:
+                             # Record allocation change
+                            allocations_dict = {}
+                            if new_asset != TICKERS["CASH"]:
+                                allocations_dict[new_asset] = new_weight
+                                if hedge_needed:
+                                    allocations_dict[TICKERS["DN"]] = HEDGE_WEIGHT # Assuming hedge is always DN
+                                allocations_dict[TICKERS["CASH"]] = max(0.0, 1.0 - sum(allocations_dict.values()))
+                            else:
+                                allocations_dict[TICKERS["CASH"]] = 1.0
+
+                            allocations.append({
+                                'date': date,
+                                'allocations': allocations_dict,
+                                'equity': today_equity
+                            })
+
+                            # Record trades if asset changed
+                            trades_executed = 0
+                            if asset_changed:
+                                if current_logic_asset != TICKERS["CASH"]:
+                                    trades.append({
+                                        'date': date,
+                                        'type': 'rebalance_sell',
+                                        'asset': current_logic_asset,
+                                        'direction': 'sell',
+                                        'price': self.prices.loc[date, current_logic_asset],
+                                        'equity': today_equity
+                                    })
+                                    trades_executed += 1
+                                
+                                if new_asset != TICKERS["CASH"]:
+                                    trades.append({
+                                        'date': date,
+                                        'type': 'rebalance_buy',
+                                        'asset': new_asset,
+                                        'direction': 'buy',
+                                        'price': self.prices.loc[date, new_asset],
+                                        'equity': today_equity
+                                    })
+                                    trades_executed += 1
+                            elif weight_changed: # Record trade if only weight changed significantly
+                                 trades.append({
+                                    'date': date,
+                                    'type': 'rebalance_adjust',
+                                    'asset': new_asset, # Asset didn't change here
+                                    'direction': 'adjust_weight',
+                                    'price': self.prices.loc[date, new_asset],
+                                    'equity': today_equity
+                                })
+                                 trades_executed += 1
+
+                            # Update current logic asset and weight
+                            current_logic_asset = new_asset
+                            current_logic_weight = new_weight
+
+                            # Set stop loss if applicable
+                            if current_logic_asset in [TICKERS["UP"], TICKERS["DN"], TICKERS["BOND"]]:
+                                atr = self._calculate_atr(current_logic_asset, date)
+                                current_price = self.prices.loc[date, current_logic_asset]
+                                if atr > 0 and pd.notna(current_price):
+                                    if current_logic_asset == TICKERS["UP"] or current_logic_asset == TICKERS["BOND"]:
+                                        stop_price = current_price - atr * ATR_MULT
+                                    elif current_logic_asset == TICKERS["DN"]:
+                                        stop_price = current_price + atr * ATR_MULT
+                                else:
+                                    stop_price = None # Cannot set stop
+                            else:
+                                stop_price = None
+                                
+                            if trades_executed > 0:
+                                last_trade_date = date
+                                weekly_trade_count[week_key] += trades_executed
+                                trade_dates.add(date)
+                        
+                        # Check for kill-switch
+                        if peak_equity <= 0:
+                             drawdown = 0.0 # Avoid division error, treat as no drawdown
+                        else:
+                             drawdown = (today_equity / peak_equity - 1)
+
+                        if drawdown < KILL_DD:
+                            print(f"{date}: KILL-SWITCH TRIGGERED: Drawdown {drawdown:.2%}")
+                            current_logic_asset = TICKERS["CASH"]
+                            current_logic_weight = 1.0
+                            stop_price = None
+                            in_cooldown = True
+                            cooldown_until = date + pd.Timedelta(weeks=COOLDOWN_WEEKS)
+                            trades.append({
+                                'date': date,
+                                'type': 'kill_switch',
+                                'asset': 'ALL',
+                                'direction': 'sell',
+                                'price': np.nan,
+                                'equity': today_equity
+                            })
+                            # No trade cost for kill switch move to cash explicitly applied here
+                            # Assume it happens EOD or next open implicitly
+            
+            # Store daily equity and update previous equity for next iteration
+            equity_curve[idx] = today_equity
+            all_dates.append(date)
+            prev_equity = today_equity
+            
+        # --- End of loop ---
         
-        # Store results
-        self.equity_curve = pd.Series(equity_curve, index=all_dates)
+        # Finalize equity curve and results
+        # Use the full date range from the data
+        self.equity_curve = pd.Series(equity_curve, index=pd.to_datetime(all_dates), name='strategy_equity')
+        
+        # Ensure the first value is exactly the initial capital
+        if not self.equity_curve.empty:
+            self.equity_curve.iloc[0] = self.initial_capital
+        
         self.trades = trades
         self.allocations = allocations
-        
-        # Calculate statistics
+
+        # Save equity curve to CSV
+        results_dir = Path('tri_shot_data')
+        results_dir.mkdir(parents=True, exist_ok=True) # Ensure directory exists
+        results_file = results_dir / 'turbo_qt_backtest_results.csv'
+
+        # Create DataFrame for saving
+        save_df = pd.DataFrame(self.equity_curve)
+        # Make sure index is named 'Date' for consistency if needed, pandas usually handles this
+        # save_df.index.name = 'Date' 
+
+        save_df.to_csv(results_file)
+        print(f"TurboQT equity curve saved to {results_file}")
+
+        # Calculate final statistics
         self._calculate_stats()
-        
-        # Add trade count statistics
-        self.stats['unique_trade_dates'] = len(trade_dates)
-        self.stats['weekly_trades_avg'] = sum(weekly_trade_count.values()) / len(weekly_trade_count) if weekly_trade_count else 0
-    
+
     def _calculate_stats(self):
         """Calculate performance statistics."""
         if self.equity_curve is None or len(self.equity_curve) == 0:

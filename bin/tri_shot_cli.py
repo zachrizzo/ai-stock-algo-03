@@ -62,33 +62,40 @@ def train_model(force=False):
     tsf.save_model(model, MODEL_FILE)
     print("Model training complete!")
 
-def backtest(days=365, plot=False, initial_capital=500.0, start_date=None, slippage_bps=1, commission_bps=1, monte_carlo=False, mc_runs=10):
+def backtest(plot=False, initial_capital=500.0, start_date=None, end_date=None, slippage_bps=1, commission_bps=1, monte_carlo=False, mc_runs=10):
     """Run a comprehensive backtest on historical data with realistic execution.
     
     Args:
-        days: Number of days to backtest (if start_date is None)
         plot: Whether to plot results
         initial_capital: Starting capital amount
         start_date: Optional specific start date (format: 'YYYY-MM-DD')
+        end_date: Optional specific end date (format: 'YYYY-MM-DD')
         slippage_bps: Slippage in basis points per side (1 bps = 0.01%)
         commission_bps: Commission in basis points per side
         monte_carlo: Whether to run Monte Carlo with randomized start dates
         mc_runs: Number of Monte Carlo runs if monte_carlo=True
     """
     if monte_carlo:
-        return run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps, mc_runs)
+        return run_monte_carlo_backtest(initial_capital, slippage_bps, commission_bps, mc_runs)
     
     # Convert transaction costs to decimal
     slippage = slippage_bps / 10000  # Convert bps to decimal
     commission = commission_bps / 10000  # Convert bps to decimal
     total_cost_per_side = slippage + commission
     
-    if start_date:
-        print(f"Running enhanced backtest from {start_date} with ${initial_capital:.2f} initial capital...")
-        print(f"Including slippage ({slippage_bps} bps) and commission ({commission_bps} bps) per side...")
+    if start_date and end_date:
+        print(f"Running enhanced backtest from {start_date} to {end_date} with ${initial_capital:.2f} initial capital...")
+    elif start_date:
+        print(f"Running enhanced backtest from {start_date} to present with ${initial_capital:.2f} initial capital...")
     else:
-        print(f"Running enhanced backtest over the last {days} days with ${initial_capital:.2f} initial capital...")
-        print(f"Including slippage ({slippage_bps} bps) and commission ({commission_bps} bps) per side...")
+        # Default behavior if no dates specified (e.g., backtest last year)
+        end_dt = dt.datetime.now(TZ)
+        start_dt = end_dt - dt.timedelta(days=365)
+        start_date = start_dt.strftime('%Y-%m-%d')
+        end_date = end_dt.strftime('%Y-%m-%d')
+        print(f"Running enhanced backtest from {start_date} to {end_date} (last 365 days) with ${initial_capital:.2f} initial capital...")
+        
+    print(f"Including slippage ({slippage_bps} bps) and commission ({commission_bps} bps) per side...")
 
     # Define tickers
     TICKERS = {
@@ -101,7 +108,6 @@ def backtest(days=365, plot=False, initial_capital=500.0, start_date=None, slipp
     }
 
     # Fetch data - use longer history for feature calculation and training
-    lookback_window = days + 400  # Add buffer for feature calculation
     tickers = list(TICKERS.values())
     # Add TLT and other data sources for enhanced features
     additional_tickers = ['TLT', 'UUP']
@@ -110,13 +116,29 @@ def backtest(days=365, plot=False, initial_capital=500.0, start_date=None, slipp
             tickers.append(ticker)
 
     print("Fetching historical data...")
-    if start_date:
-        # Convert start_date string to datetime
-        start_dt = dt.datetime.strptime(start_date, '%Y-%m-%d')
-        # Get data from start_date to present
-        prices = tsf.fetch_data_from_date(tickers, start_date=start_dt)
-    else:
-        prices = tsf.fetch_data(tickers, days=lookback_window)
+    # Convert dates
+    start_dt = pd.Timestamp(start_date, tz=TZ) if start_date else None
+    end_dt = pd.Timestamp(end_date, tz=TZ) if end_date else pd.Timestamp.now(tz=TZ)
+
+    # Fetch data slightly before start_date for lookback calculations
+    fetch_start_dt = start_dt - dt.timedelta(days=400) if start_dt else None
+    
+    prices = tsf.fetch_data_from_date(tickers, start_date=fetch_start_dt, end_date=end_dt)
+
+    # Ensure prices dataframe is filtered EXACTLY between start_dt and end_dt for backtest logic
+    if start_dt:
+        prices = prices[prices.index >= start_dt]
+    prices = prices[prices.index <= end_dt]
+    
+    if prices.empty:
+        print(f"ERROR: No price data found for the specified period: {start_date} to {end_date}")
+        return
+
+    # Determine actual start/end from data
+    actual_start_date = prices.index.min().strftime('%Y-%m-%d')
+    actual_end_date = prices.index.max().strftime('%Y-%m-%d')
+    print(f"Using data from {actual_start_date} to {actual_end_date}")
+    days = (prices.index.max() - prices.index.min()).days
 
     # Train walk-forward model or load existing one
     model_file = STATE_DIR / "tri_shot_ensemble.pkl"
@@ -436,13 +458,13 @@ def backtest(days=365, plot=False, initial_capital=500.0, start_date=None, slipp
         'trades_per_year': trades_per_year
     }
 
-def run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps, num_runs=10):
+def run_monte_carlo_backtest(initial_capital, slippage_bps, commission_bps, num_runs=10):
     """Run Monte Carlo backtest with randomized start dates."""
     print(f"Running Monte Carlo backtest with {num_runs} random start dates...")
     
     # Get a list of dates from which to start backtests
     end_date = dt.datetime.now()
-    start_date = end_date - dt.timedelta(days=days*2)  # Double the days to have enough range
+    start_date = end_date - dt.timedelta(days=730)  # Double the days to have enough range
     
     # Generate random dates between start_date and end_date
     date_range = pd.date_range(start=start_date, end=end_date, freq='B')  # Business days
@@ -461,8 +483,6 @@ def run_monte_carlo_backtest(days, initial_capital, slippage_bps, commission_bps
         print(f"\nMonte Carlo Run {i+1}/{num_runs} - Starting from {start_date}")
         try:
             result = backtest(
-                days=days, 
-                plot=(i == 0),  # Only plot the first run
                 initial_capital=initial_capital,
                 start_date=start_date,
                 slippage_bps=slippage_bps,
@@ -823,10 +843,10 @@ def main():
     
     # Backtest command
     backtest_parser = subparsers.add_parser('backtest', help='Run backtest')
-    backtest_parser.add_argument('--days', type=int, default=365, help='Number of days to backtest')
     backtest_parser.add_argument('--plot', action='store_true', help='Plot backtest results')
     backtest_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital')
     backtest_parser.add_argument('--start_date', type=str, help='Start date for backtest (YYYY-MM-DD)')
+    backtest_parser.add_argument('--end_date', type=str, help='End date for backtest (YYYY-MM-DD)')
     backtest_parser.add_argument('--slippage_bps', type=float, default=2.0, help='Slippage in basis points (bps)')
     backtest_parser.add_argument('--commission_bps', type=float, default=1.0, help='Commission in basis points (bps)')
     backtest_parser.add_argument('--monte_carlo', action='store_true', help='Run Monte Carlo simulation')
@@ -842,6 +862,7 @@ def main():
         dmt_parser = subparsers.add_parser('dmt', help='Run differentiable market twin backtest')
         dmt_parser.add_argument('--initial_capital', type=float, default=500.0, help='Initial capital')
         dmt_parser.add_argument('--start_date', type=str, help='Start date for backtest (YYYY-MM-DD)')
+        dmt_parser.add_argument('--end_date', type=str, help='End date for backtest (YYYY-MM-DD)')
         dmt_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs for optimization')
         dmt_parser.add_argument('--learning_rate', type=float, default=0.01, help='Learning rate for optimization')
         dmt_parser.add_argument('--cpu', action='store_true', help='Force CPU computation (default uses GPU if available)')
@@ -858,14 +879,16 @@ def main():
     elif args.command == 'run':
         run_strategy(force=args.force)
     elif args.command == 'backtest':
-        backtest(days=args.days, 
-                plot=args.plot, 
-                initial_capital=args.initial_capital,
-                start_date=args.start_date,
-                slippage_bps=args.slippage_bps,
-                commission_bps=args.commission_bps,
-                monte_carlo=args.monte_carlo,
-                mc_runs=args.mc_runs)
+        backtest(
+            plot=args.plot, 
+            initial_capital=args.initial_capital,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            slippage_bps=args.slippage_bps,
+            commission_bps=args.commission_bps,
+            monte_carlo=args.monte_carlo,
+            mc_runs=args.mc_runs
+        )
     elif args.command == 'paper':
         setup_paper_trade(initial_capital=args.initial_capital, days=args.days)
     elif args.command == 'dmt' and HAS_DMT_DEPS:
@@ -903,16 +926,33 @@ def run_dmt_command(args):
         if ticker not in tickers:
             tickers.append(ticker)
     
-    if args.start_date:
-        # Convert start_date string to datetime
-        start_dt = dt.datetime.strptime(args.start_date, '%Y-%m-%d')
-        print(f"Fetching data from {args.start_date} to present...")
-        prices = tsf.fetch_data_from_date(tickers, start_date=start_dt)
-    else:
-        # Default to 2 years of data for DMT
-        days = 730
-        print(f"Fetching data for the last {days} days...")
-        prices = tsf.fetch_data(tickers, days=days)
+    # Convert dates
+    start_dt = pd.Timestamp(args.start_date, tz=TZ) if args.start_date else None
+    end_dt = pd.Timestamp(args.end_date, tz=TZ) if args.end_date else pd.Timestamp.now(tz=TZ)
+
+    if not start_dt:
+        # Default to last 2 years if start_date is not provided
+        start_dt = end_dt - dt.timedelta(days=730)
+        print(f"Start date not specified, defaulting to {start_dt.strftime('%Y-%m-%d')}")
+    
+    print(f"Fetching data from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}...")
+
+    # Fetch data slightly before start_date for lookback calculations
+    fetch_start_dt = start_dt - dt.timedelta(days=100) # DMT might need less lookback than TriShot
+    
+    prices = tsf.fetch_data_from_date(tickers, start_date=fetch_start_dt, end_date=end_dt)
+
+    # Ensure prices dataframe is filtered EXACTLY between start_dt and end_dt for backtest logic
+    prices = prices[(prices.index >= start_dt) & (prices.index <= end_dt)]
+    
+    if prices.empty:
+        print(f"ERROR: No price data found for the specified period: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}")
+        return
+
+    # Determine actual start/end from data
+    actual_start_date = prices.index.min().strftime('%Y-%m-%d')
+    actual_end_date = prices.index.max().strftime('%Y-%m-%d')
+    print(f"Using data from {actual_start_date} to {actual_end_date}")
     
     # Run the simplified DMT backtest
     results = run_dmt_backtest(
@@ -929,8 +969,9 @@ def run_dmt_command(args):
     if args.start_date:
         print("\nRunning traditional backtest for comparison...")
         backtest(
-            start_date=args.start_date,
             initial_capital=args.initial_capital,
+            start_date=args.start_date,
+            end_date=args.end_date,
             slippage_bps=2.0,
             commission_bps=1.0,
             plot=True

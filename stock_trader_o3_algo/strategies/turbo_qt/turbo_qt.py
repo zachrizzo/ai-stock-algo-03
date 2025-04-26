@@ -46,7 +46,7 @@ BOND_DAYS = 30       # Bond momentum lookback
 VIX_THRESHOLD = 25   # Lower VIX threshold to catch crashes earlier
 CRASH_THRESHOLD = -0.05  # Less severe 5-day return threshold to catch crashes earlier
 HEDGE_WEIGHT = 0.25  # Allocation to hedge asset during crashes
-KILL_DD = 0.25       # Lower max drawdown to protect capital better
+KILL_DD = -0.20      # 20% max drawdown kill-switch (NEGATIVE value)
 COOLDOWN_WEEKS = 1   # Weeks to remain in cash after stop-loss
 
 # Additional strategy parameters for technical indicators

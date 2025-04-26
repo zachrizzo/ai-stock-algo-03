@@ -115,25 +115,50 @@ def select_candidate_asset(prices: pd.DataFrame, date: Optional[pd.Timestamp] = 
     return CASH_ETF
 
 
-def calculate_position_weight(prices: pd.DataFrame, candidate: str, date: Optional[pd.Timestamp] = None, min_lookback: Optional[int] = None) -> float:
+def calculate_position_weight(prices, asset, date, lookback=LOOKBACK_DAYS):
     """
-    Calculate position weight for the selected asset.
+    Calculate position weight dynamically based on volatility and conviction.
     
     Args:
-        prices: DataFrame with price data
-        candidate: Symbol of the candidate asset
-        date: Date to use for calculation (defaults to latest date in prices)
-        min_lookback: Minimum lookback period for volatility calculation
+        prices: DataFrame of asset prices
+        asset: Target asset to calculate weight for
+        date: Reference date
+        lookback: Lookback period in days
         
     Returns:
-        Target weight for the candidate asset
+        Position weight as a fraction of portfolio (0.0 to 1.0)
     """
-    # For cash ETF, use a weight of 1.0
-    if candidate == CASH_ETF:
+    # Default weight for cash or if insufficient data
+    if asset == CASH_ETF or lookback is None:
         return 1.0
     
-    # For other assets, use 0.8 (keep 20% in cash as buffer)
-    return 0.8
+    # Get historical data for the asset
+    hist_prices = prices.loc[:date, asset].iloc[-lookback:]
+    
+    # Calculate recent volatility (standard deviation of returns)
+    returns = hist_prices.pct_change().dropna()
+    volatility = returns.std() * (252 ** 0.5)  # Annualized volatility
+    
+    # Calculate trend strength (momentum)
+    recent_return = hist_prices.iloc[-1] / hist_prices.iloc[0] - 1
+    
+    # Calculate Z-score of recent return (how many standard deviations from mean)
+    z_score = abs(recent_return) / (returns.std() * (lookback ** 0.5))
+    
+    # Calculate conviction score (0.5 to 1.0)
+    conviction = min(1.0, 0.5 + (z_score / 6))  # Cap at 1.0
+    
+    # Volatility adjustment: reduce position size as volatility increases
+    # Target 20% annualized volatility for the portfolio
+    vol_adjustment = min(1.0, 0.20 / max(0.05, volatility))
+    
+    # Calculate final weight
+    weight = conviction * vol_adjustment
+    
+    # Ensure weight is within bounds
+    weight = max(0.1, min(1.0, weight))
+    
+    return weight
 
 
 def check_crash_conditions(prices: pd.DataFrame, date: Optional[pd.Timestamp] = None) -> bool:
@@ -170,17 +195,17 @@ def check_stop_loss(equity_curve: pd.Series, date: pd.Timestamp, cooldown_end_da
 def get_portfolio_allocation(
     prices: pd.DataFrame, 
     date: Optional[pd.Timestamp] = None,
-    equity: float = 100.0,
+    equity: float = 10000.0,
     equity_peak: Optional[float] = None,
     equity_curve: Optional[pd.Series] = None,
     stop_loss_cooldown_end_date: Optional[pd.Timestamp] = None
 ) -> Dict[str, float]:
     """
-    Calculate portfolio allocation based on dual momentum strategy with trend filter.
+    Get target portfolio allocation for a specific date.
     
     Args:
-        prices: DataFrame with price data
-        date: Date to use for calculation (defaults to latest date in prices)
+        prices: DataFrame of asset prices
+        date: Reference date for allocation
         equity: Current portfolio equity value
         equity_peak: Peak equity value (for drawdown calculation)
         equity_curve: Full equity curve (for stop-loss calculation)
@@ -197,6 +222,11 @@ def get_portfolio_allocation(
     if equity_peak is None:
         equity_peak = equity
     
+    # Calculate drawdown if peak is provided
+    current_drawdown = 0
+    if equity_peak > 0:
+        current_drawdown = 1 - (equity / equity_peak)
+    
     # Calculate minimum lookback based on available data
     available_days = len(prices.loc[:date])
     min_lookback_days = min(LOOKBACK_DAYS) if isinstance(LOOKBACK_DAYS, list) else LOOKBACK_DAYS
@@ -205,14 +235,25 @@ def get_portfolio_allocation(
     # Select candidate asset with adaptive lookback
     candidate = select_candidate_asset(prices, date, min_lookback)
     
-    # Calculate position weight (simplified to 1.0)
+    # Calculate dynamic position weight
     weight = calculate_position_weight(prices, candidate, date, min_lookback)
     
-    # Allocate all equity to the candidate asset
+    # Reduce position size during drawdowns (risk management)
+    if current_drawdown > 0.10:  # More than 10% drawdown
+        # Scale down position linearly, from 100% at 10% drawdown to 20% at 30% drawdown
+        drawdown_factor = max(0.2, 1.0 - ((current_drawdown - 0.10) / 0.20))
+        weight *= drawdown_factor
+    
+    # Implement a portfolio-wide stop loss (move to cash if drawdown exceeds threshold)
+    if current_drawdown > 0.25 and (stop_loss_cooldown_end_date is None or date > stop_loss_cooldown_end_date):
+        candidate = CASH_ETF
+        weight = 1.0
+    
+    # Allocate equity based on weight
     allocations = {candidate: weight * equity}
     
     # If candidate is not cash, add a zero allocation for cash for clarity
     if candidate != CASH_ETF:
-        allocations[CASH_ETF] = 0.0
+        allocations[CASH_ETF] = (1 - weight) * equity  # Remaining equity to cash
     
     return allocations
