@@ -15,7 +15,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def make_feature_matrix(prices: pd.DataFrame, 
                         target_ticker: str = "QQQ", 
-                        lookback_days: int = 300) -> Tuple[pd.DataFrame, pd.Series]:
+                        lookback_days: int = 300,
+                        handle_nans: str = 'drop') -> Tuple[pd.DataFrame, pd.Series]:
     """
     Create feature matrix and target labels for the ML model.
     
@@ -23,6 +24,8 @@ def make_feature_matrix(prices: pd.DataFrame,
         prices: DataFrame with price data for all tickers
         target_ticker: Ticker to predict (usually QQQ)
         lookback_days: Number of days to use for feature creation
+        handle_nans: How to handle NaN values: 'drop' to remove them (default),
+                    'fill_zeros' to replace with zeros, or 'fill_means' to use feature means
         
     Returns:
         X: Feature matrix
@@ -186,29 +189,39 @@ def make_feature_matrix(prices: pd.DataFrame,
     # 18. Volatility regime
     df['vol_regime'] = np.where(df[f'{target_ticker}_vol_20d'] > df[f'{target_ticker}_vol_20d'].rolling(63).mean(), 1, 0)
     
-    # Drop NaN values
-    df = df.dropna()
+    # Drop rows with NaN targets (typically the last 5 rows)
+    df = df.dropna(subset=['target'])
     
-    # Select only feature columns (drop price columns and forward returns)
-    feature_cols = [col for col in df.columns if 
-                   ('_mom_' in col or 
-                    '_vol_' in col or 
-                    '_vs_ema_' in col or
-                    '_macd' in col or
-                    '_rsi' in col or
-                    '_eff_ratio_' in col or
-                    '_kelly_' in col or
-                    '_skew_' in col or
-                    '_kurt_' in col or
-                    '_overbought' in col or
-                    '_oversold' in col or
-                    'vix' in col or
-                    'tlt_' in col or
-                    'usd_' in col or
-                    'day_' in col or
-                    'month_' in col or
-                    'vol_regime' in col)]
+    # Get all features for modeling
+    feature_cols = [col for col in df.columns if col != 'target' and col != f'{target_ticker}_fwd_5d_ret'
+                   and not any(c in col for c in ['Open', 'High', 'Low', 'Close', 'Volume', 'date'])]
     
+    # Handle NaN values in features based on the selected strategy
+    if handle_nans == 'drop':
+        # Traditional approach: drop rows with any NaN features
+        df_clean = df.dropna(subset=feature_cols)
+        print(f"Warning: Dropped {len(df) - len(df_clean)} rows due to NaN values in features")
+        df = df_clean
+    elif handle_nans == 'fill_zeros':
+        # Fill NaNs with zeros - simple but can introduce bias
+        df[feature_cols] = df[feature_cols].fillna(0)
+        print(f"Filled NaN values with zeros in {len(feature_cols)} features")
+    elif handle_nans == 'fill_means':
+        # Fill NaNs with feature means - better statistical approach
+        for col in feature_cols:
+            if df[col].isna().any():
+                # Calculate mean of non-NaN values
+                col_mean = df[col].mean(skipna=True)
+                # Replace NaNs with mean
+                df[col] = df[col].fillna(col_mean)
+        print(f"Filled NaN values with feature means in {len(feature_cols)} features")
+    else:
+        # Default to dropping NaNs
+        df_clean = df.dropna(subset=feature_cols)
+        print(f"Warning: Dropped {len(df) - len(df_clean)} rows due to NaN values in features")
+        df = df_clean
+    
+    # Return features (X) and target (y)
     X = df[feature_cols]
     y = df['target']
     

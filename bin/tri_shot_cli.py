@@ -153,9 +153,9 @@ def backtest(plot=False, initial_capital=500.0, start_date=None, end_date=None, 
         model, metrics = train_walk_forward_model(prices, save_model=True)
         print(f"Model trained with directional accuracy: {metrics['directional_accuracy']:.4f}")
 
-    # Create features for the full period
+    # Create features for the full period - use 'fill_means' to handle NaNs for early dates
     print("Generating features for backtest...")
-    X, y = tsf.make_feature_matrix(prices)
+    X, y = tsf.make_feature_matrix(prices, handle_nans='fill_means')
 
     # Generate predictions
     print("Generating predictions...")
