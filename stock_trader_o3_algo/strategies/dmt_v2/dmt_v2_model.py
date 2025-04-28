@@ -360,12 +360,13 @@ def loss_function(log_eq, rets, turn, config: Config = None):
 
 
 # Feature creation utilities
-def create_feature_matrix(prices_df, window_size=20):
+def create_feature_matrix(prices_df, window_size=20, handle_nans='drop'):
     """Create feature matrix from price DataFrame.
     
     Args:
         prices_df: DataFrame with price data
         window_size: Lookback window for features
+        handle_nans: How to handle NaN values - 'drop', 'fill_zeros', or 'fill_means'
         
     Returns:
         Feature DataFrame and target labels
@@ -386,13 +387,19 @@ def create_feature_matrix(prices_df, window_size=20):
     df['ma_5'] = df[price_col].rolling(5).mean()
     df['ma_10'] = df[price_col].rolling(10).mean()
     df['ma_20'] = df[price_col].rolling(20).mean()
+    df['ma_50'] = df[price_col].rolling(50).mean()
+    df['ma_200'] = df[price_col].rolling(200).mean()
     
     # MA ratios
     df['ma_ratio_5_20'] = df['ma_5'] / df['ma_20']
     df['ma_ratio_10_20'] = df['ma_10'] / df['ma_20']
+    df['ma_ratio_50_200'] = df['ma_50'] / df['ma_200']
     
-    # Volatility
+    # Volatility features
     df['vol_20'] = df['ret_1d'].rolling(20).std() * np.sqrt(252)
+    df['vol_50'] = df['ret_1d'].rolling(50).std() * np.sqrt(252)
+    # Volatility ratio (short-term vs long-term)
+    df['vol_ratio'] = df['ret_1d'].rolling(10).std() / df['ret_1d'].rolling(30).std()
     
     # RSI
     delta = df[price_col].diff()
@@ -402,18 +409,61 @@ def create_feature_matrix(prices_df, window_size=20):
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss.replace(0, 1e-8)
     df['rsi_14'] = 100 - (100 / (1 + rs))
+    # Add shorter and longer RSI periods
+    avg_gain_short = gain.rolling(7).mean()
+    avg_loss_short = loss.rolling(7).mean()
+    rs_short = avg_gain_short / avg_loss_short.replace(0, 1e-8)
+    df['rsi_7'] = 100 - (100 / (1 + rs_short))
+    
+    # Bollinger Bands
+    df['bb_upper'] = df['ma_20'] + 2 * df[price_col].rolling(20).std()
+    df['bb_lower'] = df['ma_20'] - 2 * df[price_col].rolling(20).std()
+    df['bb_pct'] = (df[price_col] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+    
+    # MACD
+    df['ema_12'] = df[price_col].ewm(span=12, adjust=False).mean()
+    df['ema_26'] = df[price_col].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema_12'] - df['ema_26']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+    
+    # Momentum indicators
+    df['mom_10'] = df[price_col] / df[price_col].shift(10) - 1
+    df['mom_20'] = df[price_col] / df[price_col].shift(20) - 1
+    
+    # Mean reversion signals
+    df['zscore_5d'] = (df[price_col] - df[price_col].rolling(5).mean()) / df[price_col].rolling(5).std()
+    df['zscore_10d'] = (df[price_col] - df[price_col].rolling(10).mean()) / df[price_col].rolling(10).std()
     
     # Target: binary label for positive return
     df['target'] = (df['ret_1d'].shift(-1) > 0).astype(float)
     
-    # Drop rows with NaN and create feature matrix
-    df = df.dropna()
-    
     # Create feature columns
     feature_cols = [
         'ret_1d', 'ret_5d', 'ret_10d', 'ret_20d',
-        'ma_ratio_5_20', 'ma_ratio_10_20', 'vol_20', 'rsi_14'
+        'ma_ratio_5_20', 'ma_ratio_10_20', 'ma_ratio_50_200',
+        'vol_20', 'vol_50', 'vol_ratio',
+        'rsi_7', 'rsi_14', 'bb_pct',
+        'macd', 'macd_signal', 'macd_hist',
+        'mom_10', 'mom_20',
+        'zscore_5d', 'zscore_10d'
     ]
+    
+    # Handle missing values according to the specified method
+    if handle_nans == 'drop':
+        df = df.dropna()
+    elif handle_nans == 'fill_zeros':
+        msg = f"Filled NaN values with zeros in {df[feature_cols].isna().sum().sum()} feature cells"
+        print(msg)
+        df[feature_cols] = df[feature_cols].fillna(0)
+    elif handle_nans == 'fill_means':
+        # Calculate the mean for each feature
+        feature_means = df[feature_cols].mean()
+        # Fill NaN values with the mean of each feature
+        filled_count = df[feature_cols].isna().sum().sum()
+        df[feature_cols] = df[feature_cols].fillna(feature_means)
+        print(f"Filled NaN values with feature means in {filled_count} features")
+    
     X = df[feature_cols]
     y = df['target']
     

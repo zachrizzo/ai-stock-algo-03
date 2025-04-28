@@ -38,8 +38,8 @@ def prepare_data(prices: pd.DataFrame, window_size: int = 20) -> Tuple:
         ret_tensor: Return tensors
         dates: Dates for the data points
     """
-    # Get features and targets
-    X, y, df = create_feature_matrix(prices, window_size)
+    # Get features and targets with improved NaN handling
+    X, y, df = create_feature_matrix(prices, window_size, handle_nans='fill_means')
     
     # Get returns for PnL calculation
     returns = df['ret_1d'].values
@@ -102,10 +102,10 @@ def initialize_vol_estimator(returns: torch.Tensor, window_size: int = 20) -> Tu
 def run_dmt_v2_backtest(
     prices: pd.DataFrame,
     initial_capital: float = 500.0,
-    n_epochs: int = 100,
-    learning_rate: float = 0.01,
+    n_epochs: int = 150,
+    learning_rate: float = 0.015,
     device: str = 'cpu',
-    seq_len: int = 10,
+    seq_len: int = 15,
     neutral_zone: float = 0.05,
     target_annual_vol: float = 0.20,
     vol_window: int = 20,
@@ -134,11 +134,11 @@ def run_dmt_v2_backtest(
     print(f"Target Vol: {target_annual_vol:.1%}, Window: {vol_window}, Max Size: {max_position_size:.1%}, Neutral Zone: {neutral_zone:.2f}")
     print(f"Transformer sequence length: {seq_len}, Learning rate: {learning_rate}")
     
-    # Prepare data
+    # Prepare data with enhanced feature set
     print("Preparing features and data...")
     X_tensor, y_tensor, ret_tensor, dates, df = prepare_data(prices, vol_window)
     
-    # Create sequence data for transformer
+    # Create sequence data for transformer with longer sequence
     print("Creating sequence data for transformer...")
     X_seq = create_sequence_data(X_tensor, seq_len)
     
@@ -152,13 +152,18 @@ def run_dmt_v2_backtest(
     y_tensor = y_tensor.to(device)
     ret_tensor = ret_tensor.to(device)
     
-    # Set up configuration
+    # Set up configuration with slightly modified hyperparameters
     config = Config(
+        d_model=96,
+        nhead=6,
+        nlayers=5,
+        dropout=0.15,
+        n_regimes=3,
         tau_max=target_annual_vol,
         max_pos=max_position_size,
         k0=50.0,
-        lambda_sharpe=0.10,
-        lambda_draw=0.05,
+        lambda_sharpe=0.15,
+        lambda_draw=0.08,
         lambda_turn=0.002
     )
     
@@ -198,8 +203,8 @@ def run_dmt_v2_backtest(
     # Higher random initialization to break symmetry
     with torch.no_grad():
         # Initialize with wider separation to break symmetry
-        strategy_layer.theta_L.data = torch.tensor(0.65)
-        strategy_layer.theta_S.data = torch.tensor(0.35)
+        strategy_layer.theta_L.data = torch.tensor(0.70)
+        strategy_layer.theta_S.data = torch.tensor(0.30)
         
         # Initialize regime classifier weights with some random values
         for param in regime_classifier.parameters():
@@ -215,9 +220,16 @@ def run_dmt_v2_backtest(
     threshold_params = [strategy_layer.theta_L, strategy_layer.theta_S]
     nn_params = list(pred_model.parameters()) + list(regime_classifier.parameters())
     
+    # Use AdamW optimizer with weight decay for better regularization
     optimizers = [
-        optim.Adam(threshold_params, lr=learning_rate * 20.0),  # Much higher for thresholds
-        optim.Adam(nn_params, lr=learning_rate * 2.0)           # Higher for neural networks
+        optim.AdamW(threshold_params, lr=learning_rate * 25.0, weight_decay=0.01),
+        optim.AdamW(nn_params, lr=learning_rate * 3.0, weight_decay=0.01)
+    ]
+    
+    # Learning rate schedulers for better convergence
+    schedulers = [
+        optim.lr_scheduler.CosineAnnealingLR(optimizers[0], T_max=n_epochs),
+        optim.lr_scheduler.CosineAnnealingLR(optimizers[1], T_max=n_epochs)
     ]
     
     for epoch in range(n_epochs):
@@ -261,6 +273,10 @@ def run_dmt_v2_backtest(
             strategy_layer.theta_L.clamp_(0.3, 0.7)
             strategy_layer.theta_S.clamp_(0.3, 0.7)
         # --------------------------------------------------
+        
+        # Step the schedulers
+        for scheduler in schedulers:
+            scheduler.step()
 
         # Record metrics
         losses.append(loss.item())
