@@ -106,10 +106,12 @@ def run_dmt_v2_backtest(
     learning_rate: float = 0.015,
     device: str = 'cpu',
     seq_len: int = 15,
-    neutral_zone: float = 0.05,
-    target_annual_vol: float = 0.20,
+    neutral_zone: float = 0.03,
+    target_annual_vol: float = 0.25,
     vol_window: int = 20,
-    max_position_size: float = 1.0,
+    max_position_size: float = 1.5,
+    start_date: datetime = None,
+    end_date: datetime = None,
     plot: bool = True
 ) -> pd.DataFrame:
     """Run DMT v2 backtest with transformer model.
@@ -125,14 +127,31 @@ def run_dmt_v2_backtest(
         target_annual_vol: Target annual volatility
         vol_window: Lookback window for volatility
         max_position_size: Maximum position size
+        start_date: Start date for the backtest
+        end_date: End date for the backtest
         plot: Whether to plot results
         
     Returns:
         Results DataFrame
     """
-    print(f"=== Running Advanced DMT v2 Backtest with Transformer ===")
+    print(f"=== Running Enhanced DMT v2 Backtest with Transformer and Balanced Parameters ===")
     print(f"Target Vol: {target_annual_vol:.1%}, Window: {vol_window}, Max Size: {max_position_size:.1%}, Neutral Zone: {neutral_zone:.2f}")
     print(f"Transformer sequence length: {seq_len}, Learning rate: {learning_rate}")
+    
+    # Set default dates if not provided
+    if start_date is None:
+        start_date = datetime(2023, 1, 1)
+    if end_date is None:
+        end_date = datetime(2025, 1, 31)
+        
+    # Ensure dates are in datetime format
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d')
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    
+    # Filter prices by date
+    prices = prices[(prices.index >= start_date) & (prices.index <= end_date)]
     
     # Prepare data with enhanced feature set
     print("Preparing features and data...")
@@ -152,7 +171,7 @@ def run_dmt_v2_backtest(
     y_tensor = y_tensor.to(device)
     ret_tensor = ret_tensor.to(device)
     
-    # Set up configuration with slightly modified hyperparameters
+    # Set up configuration with balanced hyperparameters
     config = Config(
         d_model=96,
         nhead=6,
@@ -203,8 +222,8 @@ def run_dmt_v2_backtest(
     # Higher random initialization to break symmetry
     with torch.no_grad():
         # Initialize with wider separation to break symmetry
-        strategy_layer.theta_L.data = torch.tensor(0.70)
-        strategy_layer.theta_S.data = torch.tensor(0.30)
+        strategy_layer.theta_L.data = torch.tensor(0.65)
+        strategy_layer.theta_S.data = torch.tensor(0.35)
         
         # Initialize regime classifier weights with some random values
         for param in regime_classifier.parameters():
@@ -222,8 +241,8 @@ def run_dmt_v2_backtest(
     
     # Use AdamW optimizer with weight decay for better regularization
     optimizers = [
-        optim.AdamW(threshold_params, lr=learning_rate * 25.0, weight_decay=0.01),
-        optim.AdamW(nn_params, lr=learning_rate * 3.0, weight_decay=0.01)
+        optim.AdamW(threshold_params, lr=learning_rate * 20.0, weight_decay=0.01),
+        optim.AdamW(nn_params, lr=learning_rate * 2.0, weight_decay=0.01)
     ]
     
     # Learning rate schedulers for better convergence
@@ -470,4 +489,34 @@ def run_dmt_v2_backtest(
         print(f"\nPlot saved to {plot_path}")
         print(f"Results saved to {results_path}")
     
-    return results
+    # Compute performance metrics
+    equity_curve = results['dmt_v2_equity']
+    performance_metrics = {
+        'Strategy': 'DMT_v2',
+        'Initial Value': equity_curve.iloc[0],
+        'Final Value': equity_curve.iloc[-1],
+        'Total Return': equity_curve.iloc[-1] / equity_curve.iloc[0] - 1,
+        'Period': f"{results.index.min().strftime('%Y-%m-%d')} to {results.index.max().strftime('%Y-%m-%d')}",
+        'Trading Days': len(results),
+        'Equity Curve': equity_curve,
+    }
+    
+    # Calculate years for CAGR
+    days = (results.index.max() - results.index.min()).days
+    years = max(days / 365.25, 0.1)  # Avoid division by zero
+    performance_metrics['CAGR'] = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / years) - 1
+    
+    # Calculate volatility
+    returns_pct = equity_curve.pct_change().dropna()
+    performance_metrics['Volatility'] = returns_pct.std() * np.sqrt(252)
+    
+    # Calculate drawdown
+    peak = equity_curve.cummax()
+    drawdown = (equity_curve / peak - 1)
+    performance_metrics['Max Drawdown'] = drawdown.min()
+    
+    # Calculate Sharpe ratio
+    risk_free_rate = 0.02  # Assumed risk-free rate
+    performance_metrics['Sharpe Ratio'] = (performance_metrics['CAGR'] - risk_free_rate) / performance_metrics['Volatility']
+    
+    return results, performance_metrics

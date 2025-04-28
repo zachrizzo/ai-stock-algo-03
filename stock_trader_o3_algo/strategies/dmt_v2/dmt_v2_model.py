@@ -195,16 +195,23 @@ class StrategyLayer(nn.Module):
         self.nz_lin = nn.Linear(n_regimes, 1)
         self.tau_lin = nn.Linear(n_regimes, 1)
         
+        # Max position size per regime - new addition
+        self.max_pos_lin = nn.Linear(n_regimes, 1)
+        
         # Initialize to sensible defaults
         with torch.no_grad():
             # Initialize neutral zone to be wider in regime 2 (choppy) than in regime 1 (trending)
             self.nz_lin.weight.data = torch.tensor([[0.01, 0.0, 0.05]])
-            self.nz_lin.bias.data.fill_(0.02)  # Base neutral zone size
+            self.nz_lin.bias.data.fill_(0.02)  # Base neutral zone size - smaller than before
             
             # Initialize target vol to be higher in regime 1 (trending) than in regime 2 (choppy)
-            self.tau_lin.weight.data = torch.tensor([[0.0, 0.5, -0.5]])
-            self.tau_lin.bias.data.fill_(0.0)  # Start with mid-level target vol
-
+            self.tau_lin.weight.data = torch.tensor([[0.2, 0.5, -0.5]])
+            self.tau_lin.bias.data.fill_(0.1)  # Start with higher base target vol
+            
+            # Initialize max position size with dynamic regime settings
+            self.max_pos_lin.weight.data = torch.tensor([[0.5, 0.8, -0.5]])
+            self.max_pos_lin.bias.data.fill_(0.2)  # Base max position size
+        
     def forward(self, p_t, sigma_t, regime_logits):
         """Compute position size with adaptive controls.
         
@@ -221,17 +228,27 @@ class StrategyLayer(nn.Module):
         theta_S = self.theta_S.clamp(0.3, 0.7)
         
         # Compute adaptive neutral zone and target vol based on regime
-        nz_t = F.softplus(self.nz_lin(regime_logits).squeeze(-1))  # Ensures nz_t ≥ 0
-        tau_t = torch.sigmoid(self.tau_lin(regime_logits).squeeze(-1)) * self.config.tau_max
+        # Slightly smaller neutral zone (less aggressive than before)
+        nz_t = F.softplus(self.nz_lin(regime_logits).squeeze(-1)) * 0.8
         
-        # Get steepness factor
-        k = torch.exp(self.log_k)
+        # Moderately higher target vol (less aggressive)
+        tau_t = (torch.sigmoid(self.tau_lin(regime_logits)).squeeze(-1) * 0.3 + 0.7) * self.config.tau_max
+        
+        # Dynamic max position based on regime - calculate max position as scalar
+        max_pos_scalar = self.config.max_pos
+        max_pos_modifier = (torch.sigmoid(self.max_pos_lin(regime_logits)).squeeze(-1) * 0.4 + 0.7).mean().item()
+        effective_max_pos = max_pos_scalar * max_pos_modifier
+        
+        # Get steepness factor - slightly increased for sharper transitions
+        k = torch.exp(self.log_k) * 1.1
         
         # Compute masks for long and short positions using thresholds directly
-        long_mask = (p_t > theta_L).float()
-        short_mask = (p_t < theta_S).float()
+        # Slightly narrower threshold gap for more time in market
+        gap_adjust = 0.015  # Less aggressive threshold adjustment
+        long_mask = (p_t > (theta_L - gap_adjust)).float()
+        short_mask = (p_t < (theta_S + gap_adjust)).float()
         
-        # Compute signal strengths using clamped thresholds
+        # Compute signal strengths using clamped thresholds and increased steepness
         long_sig = torch.sigmoid(k * (p_t - theta_L)) * long_mask
         short_sig = torch.sigmoid(k * (theta_S - p_t)) * short_mask
         
@@ -239,8 +256,10 @@ class StrategyLayer(nn.Module):
         norm_sum = long_sig + short_sig + self.config.eps
         pos_dir = (long_sig / norm_sum) - (short_sig / norm_sum)
         
-        # Apply volatility scaling
-        dyn_size = (tau_t / (sigma_t + self.config.eps)).clamp(0, self.config.max_pos)
+        # Apply volatility scaling with scalar max position size
+        dyn_size = (tau_t / (sigma_t + self.config.eps)).clamp(0, effective_max_pos)
+        
+        # Apply position scaling
         position_t = pos_dir * dyn_size
         
         return position_t
