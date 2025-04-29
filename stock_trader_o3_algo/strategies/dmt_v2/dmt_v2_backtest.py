@@ -216,220 +216,266 @@ def run_dmt_v2_backtest(
     sharpes = []
     log_returns = []
     
-    # Training loop with improved initialization
+    # Train model
     print(f"Optimizing DMT v2 strategy for {n_epochs} epochs...")
     
-    # Higher random initialization to break symmetry
-    with torch.no_grad():
-        # Initialize with wider separation to break symmetry
-        strategy_layer.theta_L.data = torch.tensor(0.65)
-        strategy_layer.theta_S.data = torch.tensor(0.35)
+    # More aggressive learning rate schedule
+    initial_lr = learning_rate 
+    min_lr = initial_lr * 0.1
+    
+    # Initialize model with better starting weights
+    strategy_layer.theta_L.data = torch.tensor(0.55, device=device)
+    strategy_layer.theta_S.data = torch.tensor(0.45, device=device)
+    
+    # Stabilize training with improved optimizer settings
+    optimizer = torch.optim.Adam([
+        {'params': pred_model.parameters(), 'lr': learning_rate},
+        {'params': regime_classifier.parameters(), 'lr': learning_rate * 1.5},
+        {'params': strategy_layer.parameters(), 'lr': learning_rate * 2.0},
+    ], weight_decay=0.0001)
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, min_lr=min_lr
+    )
+    
+    # Improved training loop with early stopping
+    best_loss = float('inf')
+    patience = 15
+    patience_counter = 0
+    best_model_state_pred = None
+    best_model_state_regime = None
+    best_model_state_strategy = None
+    
+    T = X_seq.shape[0]
+    sigma_est = torch.ones(T, device=device) * target_annual_vol
+    
+    for epoch in range(1, n_epochs + 1):
+        # Forward pass
+        print(f"Debug - Preparing tensors for training:")
+        print(f"X_seq shape: {X_seq.shape}")
+        print(f"ret_tensor shape: {ret_tensor.shape}")
         
-        # Initialize regime classifier weights with some random values
-        for param in regime_classifier.parameters():
-            param.data = param.data + torch.randn_like(param.data) * 0.1
-            
-        # Initialize transformer weights with some random values
-        for param in pred_model.parameters():
-            if len(param.shape) > 1:  # Only randomize matrices, not biases
-                param.data = param.data + torch.randn_like(param.data) * 0.1
-    
-    # Use higher learning rate for faster convergence and separate optimizers
-    # Higher rate for threshold parameters, lower for neural network
-    threshold_params = [strategy_layer.theta_L, strategy_layer.theta_S]
-    nn_params = list(pred_model.parameters()) + list(regime_classifier.parameters())
-    
-    # Use AdamW optimizer with weight decay for better regularization
-    optimizers = [
-        optim.AdamW(threshold_params, lr=learning_rate * 20.0, weight_decay=0.01),
-        optim.AdamW(nn_params, lr=learning_rate * 2.0, weight_decay=0.01)
-    ]
-    
-    # Learning rate schedulers for better convergence
-    schedulers = [
-        optim.lr_scheduler.CosineAnnealingLR(optimizers[0], T_max=n_epochs),
-        optim.lr_scheduler.CosineAnnealingLR(optimizers[1], T_max=n_epochs)
-    ]
-    
-    for epoch in range(n_epochs):
-        # Reset gradients
-        for opt in optimizers:
-            opt.zero_grad()
-        
-        # Forward pass through prediction model
+        # Create tensors with correct lengths
         p_t, q_lo, q_hi = pred_model(X_seq)
         
-        # Forward pass through regime classifier
-        regime_logits = regime_classifier(X_seq[:, -1])
+        # Fixed: Use X_seq[:, -1, :] to get the final element of each sequence for regime classifier
+        # This reduces the dimensions to [432, 20]
+        final_inputs = X_seq[:, -1, :]
+        regime_logits = regime_classifier(final_inputs)
         
-        # Estimate volatility (simplified for backtest)
-        sigma_t = torch.ones_like(p_t) * target_annual_vol
+        # Debug tensor shapes
+        print(f"Debug - Generated predictions:")
+        print(f"p_t shape: {p_t.shape}")
+        print(f"final_inputs shape: {final_inputs.shape}")
+        print(f"regime_logits shape: {regime_logits.shape}")
+        print(f"sigma_est shape: {sigma_est.shape}")
         
-        # Expand regime_logits to match batch size
-        regime_logits_batch = regime_logits.unsqueeze(1).expand(-1, p_t.shape[0] // regime_logits.shape[0], -1)
-        regime_logits_batch = regime_logits_batch.reshape(-1, config.n_regimes)
+        # Initialize sigma directly with correct size to match p_t
+        sigma_est = torch.ones_like(p_t) * target_annual_vol
+        print(f"Debug - After reshaping:")
+        print(f"p_t shape: {p_t.shape}")
+        print(f"regime_logits shape: {regime_logits.shape}")
+        print(f"sigma_est shape: {sigma_est.shape}")
         
-        # Run backtest
-        log_eq, rets, turn = backtester(
-            p_t.unsqueeze(0), sigma_t.unsqueeze(0),
-            regime_logits_batch.unsqueeze(0), ret_tensor.unsqueeze(0)
-        )
+        # Forward pass through strategy layer
+        pos_t = strategy_layer(p_t, sigma_est, regime_logits)
         
-        # Compute loss
-        loss = loss_function(log_eq, rets, turn, config)
+        # Debug tensor shapes before return calculation
+        print(f"Debug - Before returns calculation:")
+        print(f"pos_t shape: {pos_t.shape}")
+        print(f"ret_tensor shape: {ret_tensor.shape}")
         
-        # Add a small regularization term to encourage parameter changes
-        param_reg = 0.01 * (strategy_layer.theta_L - 0.55).pow(2) + 0.01 * (strategy_layer.theta_S - 0.45).pow(2)
+        # Align tensors properly for returns calculation
+        # We need to make sure pos_t and ret_tensor have the same dimensions
+        # Using pos_t[:-1] * ret_tensor[1:] would cause us to miss the first return
+        # Instead, we'll use pos_t to compute returns on the next day's price change
+        aligned_pos = pos_t[:-1]  # Remove the last position since we don't have a return for it
+        aligned_ret = ret_tensor[1:]  # Remove the first return since we don't have a position for it yet
+        
+        print(f"Debug - After alignment:")
+        print(f"aligned_pos shape: {aligned_pos.shape}")
+        print(f"aligned_ret shape: {aligned_ret.shape}")
+        
+        # Calculate log returns using the aligned tensors
+        log_rets = aligned_pos * aligned_ret
+        
+        # Calculate portfolio equity curve (cumulative log returns)
+        log_eq = torch.zeros(T)
+        log_eq[1:] = torch.cumsum(log_rets, dim=0)
+        
+        # Calculate Sharpe ratio (mean return / std of returns)
+        mu = log_rets.mean()
+        sigma = log_rets.std() + 1e-6  # Add small epsilon to avoid division by zero
+        sharpe = mu / sigma * np.sqrt(252.0)  # Annualize
+        
+        # Loss is negative Sharpe (we want to maximize Sharpe)
+        loss = -sharpe
+        
+        # Add parameter regularization term to encourage parameter movement
+        param_reg = 0.0001 * (torch.abs(strategy_layer.theta_L - 0.5) + torch.abs(strategy_layer.theta_S - 0.5))
         loss = loss - param_reg  # Subtract to encourage movement away from initialization
         
         # Backward pass and optimization
+        optimizer.zero_grad()
         loss.backward()
-        for opt in optimizers:
-            opt.step()
-
-        # --- Add parameter clamping after optimizer step ---
-        with torch.no_grad():
-            strategy_layer.theta_L.clamp_(0.3, 0.7)
-            strategy_layer.theta_S.clamp_(0.3, 0.7)
-        # --------------------------------------------------
         
-        # Step the schedulers
-        for scheduler in schedulers:
-            scheduler.step()
-
+        # Gradient clipping to prevent exploding gradients
+        # Collect all parameters for clipping
+        all_params = list(pred_model.parameters()) + list(regime_classifier.parameters()) + list(strategy_layer.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+        
+        optimizer.step()
+        
+        # Update learning rate
+        scheduler.step(loss.item())
+        
+        # Print progress
+        if epoch == 1 or epoch % 10 == 0 or epoch == n_epochs:
+            print(f"Epoch {epoch}/{n_epochs}, Loss: {loss.item():.4f}, Sharpe: {-loss.item():.2f}, LogReturn: {log_eq[-1].item():.4f}")
+            print(f"  Parameters - Long: {strategy_layer.theta_L.item():.3f}, Short: {strategy_layer.theta_S.item():.3f}")
+            
+            # Print prediction statistics for debugging
+            print(f"    Predictions (p_t) - Min: {p_t.min().item():.3f}, Max: {p_t.max().item():.3f}, Mean: {p_t.mean().item():.3f}")
+            print(f"    Regime logits - Mean: {regime_logits.mean(dim=0)}")
+        
+        # Early stopping check
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0
+            # Save best model states
+            best_model_state_pred = {k: v.clone() for k, v in pred_model.state_dict().items()}
+            best_model_state_regime = {k: v.clone() for k, v in regime_classifier.state_dict().items()}
+            best_model_state_strategy = {k: v.clone() for k, v in strategy_layer.state_dict().items()}
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                # Restore best model states
+                pred_model.load_state_dict(best_model_state_pred)
+                regime_classifier.load_state_dict(best_model_state_regime)
+                strategy_layer.load_state_dict(best_model_state_strategy)
+                break
+        
         # Record metrics
         losses.append(loss.item())
         
         # Calculate Sharpe for monitoring
-        mean_ret = rets.mean(dim=1)
-        std_ret = rets.std(dim=1) + config.eps
-        sharpe = (mean_ret / std_ret * np.sqrt(252)).item()
+        sharpe = -loss.item()  # Since loss is -Sharpe
         sharpes.append(sharpe)
         
         # Calculate log return for monitoring
-        log_ret = (log_eq[:, -1] - log_eq[:, 0]).item()
+        log_ret = log_eq[-1].item()
         log_returns.append(log_ret)
-        
-        # Print progress
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}/{n_epochs}, Loss: {loss.item():.4f}, Sharpe: {sharpe:.2f}, LogReturn: {log_ret:.4f}")
-            print(f"  Parameters - Long: {strategy_layer.theta_L.item():.3f}, Short: {strategy_layer.theta_S.item():.3f}")
-            
-            # Log prediction statistics
-            p_t_min = p_t.min().item()
-            p_t_max = p_t.max().item()
-            p_t_mean = p_t.mean().item()
-            print(f"    Predictions (p_t) - Min: {p_t_min:.3f}, Max: {p_t_max:.3f}, Mean: {p_t_mean:.3f}")
     
     # Final forward pass for evaluation
     print("\nRunning final evaluation with optimized DMT v2 parameters...")
+    
     with torch.no_grad():
         # Get predictions
         p_t, q_lo, q_hi = pred_model(X_seq)
         
         # Get regime classifications
-        regime_logits = regime_classifier(X_seq[:, -1])
+        final_inputs = X_seq[:, -1, :]
+        regime_logits = regime_classifier(final_inputs)
         
         # Use constant volatility for simplicity in the demo
         sigma_t = torch.ones_like(p_t) * target_annual_vol
         
-        # Prepare regime logits for batch
-        regime_logits_batch = regime_logits.unsqueeze(1).expand(-1, p_t.shape[0] // regime_logits.shape[0], -1)
-        regime_logits_batch = regime_logits_batch.reshape(-1, config.n_regimes)
+        # Get positions directly from the strategy layer
+        positions_tensor = strategy_layer(p_t, sigma_t, regime_logits)
         
-        # Get positions
-        positions = [0.0]  # Start with zero position before first trade
-        for i in range(len(p_t)):
-            pos = strategy_layer(
-                p_t[i:i+1], sigma_t[i:i+1], regime_logits_batch[i:i+1]
-            ).item()
-            positions.append(pos)  # Add position AFTER getting prediction
-        
-        # Calculate equity curve manually for demonstration
-        equity = [initial_capital]
-        for i in range(len(p_t)):
-            ret = ret_tensor[i].item()
-            pos = positions[i+1]  # Use position from positions (shifted by 1)
-            
-            # Transaction cost (if not the first position)
-            tc = config.trans_cost * abs(pos - positions[i]) if i > 0 else config.trans_cost * abs(pos)
-            
-            # Calculate new equity
-            new_equity = equity[-1] * (1 + pos * ret - tc)
-            equity.append(new_equity)
-        
-        # Create baseline (equal size) for comparison
-        baseline_pos = [0.0]  # Start with zero position before first trade
-        for i in range(len(p_t)):
-            pos = 1.0 if p_t[i].item() > 0.5 else -1.0 if p_t[i].item() < 0.5 else 0.0
-            baseline_pos.append(pos)
-            
-        baseline_equity = [initial_capital]
-        for i in range(len(ret_tensor)):
-            ret = ret_tensor[i].item()
-            pos = baseline_pos[i+1]  # Use position from baseline_pos (shifted by 1)
-            
-            # Transaction cost (if not the first position)
-            tc = config.trans_cost * abs(pos - baseline_pos[i]) if i > 0 else config.trans_cost * abs(pos)
-            
-            # Calculate new equity
-            new_equity = baseline_equity[-1] * (1 + pos * ret - tc)
-            baseline_equity.append(new_equity)
-        
-        # Calculate buy and hold equity
-        buy_hold = [initial_capital]
-        for ret in ret_tensor:
-            new_equity = buy_hold[-1] * (1 + ret.item())
-            buy_hold.append(new_equity)
+        # Convert to list for backtesting
+        positions = positions_tensor.cpu().numpy().tolist()
     
-    # Compute performance metrics
-    # DMT v2
-    dmt_returns = np.diff(equity) / equity[:-1]
-    dmt_ann_return = np.mean(dmt_returns) * 252
-    dmt_ann_vol = np.std(dmt_returns) * np.sqrt(252)
-    dmt_sharpe = dmt_ann_return / dmt_ann_vol if dmt_ann_vol != 0 else 0
-    dmt_max_dd = max(1 - equity[i] / max(equity[:i+1]) for i in range(len(equity)))
-    dmt_total_return = (equity[-1] / equity[0] - 1) * 100
+    # Convert tensors to numpy arrays
+    dates_np = dates
+    returns_np = ret_tensor.cpu().numpy()
     
-    # Baseline
-    baseline_returns = np.diff(baseline_equity) / baseline_equity[:-1]
-    baseline_ann_return = np.mean(baseline_returns) * 252
-    baseline_ann_vol = np.std(baseline_returns) * np.sqrt(252)
-    baseline_sharpe = baseline_ann_return / baseline_ann_vol if baseline_ann_vol != 0 else 0
-    baseline_max_dd = max(1 - baseline_equity[i] / max(baseline_equity[:i+1]) for i in range(len(baseline_equity)))
-    baseline_total_return = (baseline_equity[-1] / baseline_equity[0] - 1) * 100
+    # Initialize arrays for equity curves
+    equity = [initial_capital]  # DMT v2 strategy
+    baseline_equity = [initial_capital]  # Baseline long-only strategy
+    buy_hold = [initial_capital]  # Buy and hold
     
-    # Print performance
+    # Run backtest with optimized parameters
+    for i in range(len(returns_np)):
+        # DMT v2 strategy (position is already determined from the optimization)
+        ret_dmt_v2 = returns_np[i] * positions[i] 
+        equity.append(equity[-1] * (1 + ret_dmt_v2))
+        
+        # Baseline strategy (always fully invested)
+        ret_baseline = returns_np[i] * 1.0  # Assumes always fully invested
+        baseline_equity.append(baseline_equity[-1] * (1 + ret_baseline))
+        
+        # Buy and hold
+        buy_hold.append(buy_hold[-1] * (1 + returns_np[i]))
+    
+    # Calculate performance metrics
+    # DMT v2 Strategy
+    total_return_dmt_v2 = equity[-1] / equity[0] - 1
+    
+    # Calculate days and annualized return
+    days = (dates_np[-1] - dates_np[0]).days
+    years = max(days / 365.25, 0.1)  # Avoid division by zero
+    cagr_dmt_v2 = (equity[-1] / equity[0]) ** (1 / years) - 1
+    
+    # Calculate volatility and drawdown
+    daily_returns_dmt_v2 = [(equity[i] / equity[i-1]) - 1 for i in range(1, len(equity))]
+    vol_dmt_v2 = np.std(daily_returns_dmt_v2) * np.sqrt(252)
+    
+    # Calculate max drawdown
+    peak = np.maximum.accumulate(equity)
+    drawdown = (np.array(equity) / peak - 1)
+    max_dd_dmt_v2 = drawdown.min()
+    
+    # Calculate Sharpe ratio
+    excess_return = cagr_dmt_v2 - 0.02  # Assuming 2% risk-free rate
+    sharpe_dmt_v2 = excess_return / vol_dmt_v2 if vol_dmt_v2 > 0 else 0
+    
+    # Baseline Strategy
+    total_return_baseline = baseline_equity[-1] / baseline_equity[0] - 1
+    cagr_baseline = (baseline_equity[-1] / baseline_equity[0]) ** (1 / years) - 1
+    
+    daily_returns_baseline = [(baseline_equity[i] / baseline_equity[i-1]) - 1 for i in range(1, len(baseline_equity))]
+    vol_baseline = np.std(daily_returns_baseline) * np.sqrt(252)
+    
+    peak_baseline = np.maximum.accumulate(baseline_equity)
+    drawdown_baseline = (np.array(baseline_equity) / peak_baseline - 1)
+    max_dd_baseline = drawdown_baseline.min()
+    
+    excess_return_baseline = cagr_baseline - 0.02
+    sharpe_baseline = excess_return_baseline / vol_baseline if vol_baseline > 0 else 0
+    
+    # Print results
     print("\n=== Performance Comparison ===")
-    print(f"DMT v2 Strategy (Optimized):")
+    print("DMT v2 Strategy (Optimized):")
     print(f"  Final Value:    ${equity[-1]:.2f}")
-    print(f"  Total Return:   {dmt_total_return:.2f}%")
-    print(f"  Annualized:     {dmt_ann_return*100:.2f}%")
-    print(f"  Volatility:     {dmt_ann_vol*100:.2f}%")
-    print(f"  Sharpe Ratio:   {dmt_sharpe:.2f}")
-    print(f"  Max Drawdown:   {dmt_max_dd*100:.2f}%")
+    print(f"  Total Return:   {total_return_dmt_v2:.2%}")
+    print(f"  Annualized:     {cagr_dmt_v2:.2%}")
+    print(f"  Volatility:     {vol_dmt_v2:.2%}")
+    print(f"  Sharpe Ratio:   {sharpe_dmt_v2:.2f}")
+    print(f"  Max Drawdown:   {max_dd_dmt_v2:.2%}")
     
-    print(f"\nBaseline Strategy (Fixed Size):")
+    print("\nBaseline Strategy (Fixed Size):")
     print(f"  Final Value:    ${baseline_equity[-1]:.2f}")
-    print(f"  Total Return:   {baseline_total_return:.2f}%")
-    print(f"  Annualized:     {baseline_ann_return*100:.2f}%")
-    print(f"  Volatility:     {baseline_ann_vol*100:.2f}%")
-    print(f"  Sharpe Ratio:   {baseline_sharpe:.2f}")
-    print(f"  Max Drawdown:   {baseline_max_dd*100:.2f}%")
+    print(f"  Total Return:   {total_return_baseline:.2%}")
+    print(f"  Annualized:     {cagr_baseline:.2%}")
+    print(f"  Volatility:     {vol_baseline:.2%}")
+    print(f"  Sharpe Ratio:   {sharpe_baseline:.2f}")
+    print(f"  Max Drawdown:   {max_dd_baseline:.2%}")
     
-    print(f"\nOptimized Parameters:")
+    print("\nOptimized Parameters:")
     print(f"  Long Threshold: {strategy_layer.theta_L.item():.3f}")
     print(f"  Short Threshold: {strategy_layer.theta_S.item():.3f}")
     
-    # Create results DataFrame (make sure lengths match)
-    results = pd.DataFrame(index=dates)
-    results['date'] = dates
+    # Create results DataFrame
+    results = pd.DataFrame(index=dates_np)
     
     # Adjust equity arrays if needed (they should have the same length now)
-    equity_series = pd.Series(equity[1:], index=dates)
-    baseline_series = pd.Series(baseline_equity[1:], index=dates)
-    buy_hold_series = pd.Series(buy_hold[1:], index=dates)
-    position_series = pd.Series(positions[1:], index=dates)
+    equity_series = pd.Series(equity[1:], index=dates_np)
+    baseline_series = pd.Series(baseline_equity[1:], index=dates_np)
+    buy_hold_series = pd.Series(buy_hold[1:], index=dates_np)
+    position_series = pd.Series(positions, index=dates_np)
     
     # Assign to results
     results['dmt_v2_equity'] = equity_series

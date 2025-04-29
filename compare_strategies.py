@@ -187,86 +187,68 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
         
         elif strategy_name == "DMT_v2":
             try:
-                # First attempt to load saved results from another strategy and scale
-                results_file = os.path.join('tri_shot_data', 'dmt_backtest_results.csv')
-                if os.path.exists(results_file):
-                    # Load DMT results as a starting point
-                    print(f"Loading DMT results as base for enhanced DMT_v2")
-                    results_df = pd.read_csv(results_file, index_col=0, parse_dates=True)
-                    
-                    # Find the equity column
-                    equity_col = None
-                    for col in results_df.columns:
-                        if 'equity' in col.lower() and 'bench' not in col.lower():
-                            equity_col = col
-                            break
-                    
-                    if equity_col:
-                        # Create scaled equity curve for DMT_v2
-                        base_equity = results_df[equity_col].copy()
-                        
-                        # Scale the returns by 2.5x to boost performance
-                        # This simulates more aggressive position sizing without rerunning everything
-                        enhanced_factor = 2.5
-                        
-                        # Calculate initial value
-                        initial_value = base_equity.iloc[0]
-                        
-                        # Calculate returns
-                        daily_returns = base_equity.pct_change().fillna(0)
-                        enhanced_returns = daily_returns * enhanced_factor
-                        
-                        # Build new equity curve
-                        dmt_v2_equity = pd.Series(index=base_equity.index, dtype=float)
-                        dmt_v2_equity.iloc[0] = initial_value
-                        
-                        for i in range(1, len(base_equity)):
-                            dmt_v2_equity.iloc[i] = dmt_v2_equity.iloc[i-1] * (1 + enhanced_returns.iloc[i])
-                        
-                        # Add to results DataFrame
-                        results_df['dmt_v2_equity'] = dmt_v2_equity
-                        
-                        # Create performance metrics
-                        performance_metrics = {
-                            'Strategy': strategy_name,
-                            'Initial Value': initial_value,
-                            'Final Value': dmt_v2_equity.iloc[-1],
-                            'Total Return': dmt_v2_equity.iloc[-1] / initial_value - 1,
-                            'Period': f"{results_df.index.min().strftime('%Y-%m-%d')} to {results_df.index.max().strftime('%Y-%m-%d')}",
-                            'Trading Days': (results_df.index.max() - results_df.index.min()).days,
-                            'Equity Curve': dmt_v2_equity
-                        }
-                        
-                        # Calculate additional metrics
-                        # Calculate years
-                        days = performance_metrics['Trading Days']
-                        years = days / 365.25
-                        
-                        # CAGR
-                        performance_metrics['CAGR'] = (performance_metrics['Final Value'] / performance_metrics['Initial Value']) ** (1 / years) - 1
-                        
-                        # Volatility
-                        returns = dmt_v2_equity.pct_change().dropna()
-                        performance_metrics['Volatility'] = returns.std() * np.sqrt(252)
-                        
-                        # Max Drawdown
-                        peak = dmt_v2_equity.cummax()
-                        drawdown = (dmt_v2_equity / peak - 1)
-                        performance_metrics['Max Drawdown'] = drawdown.min()
-                        
-                        # Sharpe
-                        performance_metrics['Sharpe Ratio'] = (performance_metrics['CAGR'] - 0.02) / performance_metrics['Volatility']
-                        
-                        print(f"Enhanced DMT_v2: Final value ${dmt_v2_equity.iloc[-1]:.2f}, Return: {performance_metrics['Total Return']*100:.2f}%")
-                        print(f"Enhancement applied: {enhanced_factor}x leverage scaling")
-                        
-                        return results_df, performance_metrics
+                # Run an actual DMT_v2 backtest instead of scaling DMT results
+                print("Running real DMT_v2 backtest with enhanced parameters...")
                 
-                print("No base results found for DMT_v2 enhancement")
-                return None, {}
-                    
+                # Import yfinance for data fetching
+                import yfinance as yf
+                
+                # Fetch price data for DMT_v2
+                ticker = 'SPY'
+                start_fetch = (start_date - pd.Timedelta(days=252)).strftime('%Y-%m-%d')  # Extra year for lookback
+                end_fetch = end_date.strftime('%Y-%m-%d')
+                
+                print(f"Fetching {ticker} data from {start_fetch} to {end_fetch}")
+                raw_prices = yf.download(ticker, start=start_fetch, end=end_fetch)
+                
+                if isinstance(raw_prices.columns, pd.MultiIndex):
+                    # Flatten MultiIndex if present
+                    prices = pd.DataFrame()
+                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                        if (col, ticker) in raw_prices.columns:
+                            prices[col] = raw_prices[(col, ticker)]
+                else:
+                    prices = raw_prices
+                
+                print(f"Downloaded {len(prices)} days of {ticker} price data")
+                
+                # Run actual DMT_v2 backtest with enhanced parameters
+                results_df, metrics = run_dmt_v2_backtest(
+                    prices=prices,
+                    initial_capital=capital,
+                    n_epochs=100,  # Use more epochs for better results
+                    learning_rate=0.015,  # Higher learning rate
+                    neutral_zone=0.03,  # Smaller neutral zone for more trades
+                    target_annual_vol=0.35,  # Higher target volatility
+                    max_position_size=2.0,  # More aggressive position sizing
+                    plot=False
+                )
+                
+                # Create comprehensive performance metrics
+                performance_metrics = {
+                    'Strategy': strategy_name,
+                    'Initial Value': metrics['Initial Value'],
+                    'Final Value': metrics['Final Value'],
+                    'Total Return': metrics['Total Return'],
+                    'Period': metrics['Period'],
+                    'Trading Days': metrics['Trading Days'],
+                    'Equity Curve': results_df['dmt_v2_equity'],
+                    'CAGR': metrics['CAGR'],
+                    'Volatility': metrics['Volatility'],
+                    'Max Drawdown': metrics['Max Drawdown'],
+                    'Sharpe Ratio': metrics['Sharpe Ratio']
+                }
+                
+                # Save to CSV for later reference
+                results_df.to_csv('tri_shot_data/dmt_v2_backtest_results.csv')
+                
+                print(f"DMT_v2 backtest completed: Final value ${performance_metrics['Final Value']:.2f}, Total Return: {performance_metrics['Total Return']*100:.2f}%")
+                
+                return results_df, performance_metrics
+                
             except Exception as e:
-                print(f"Error calculating DMT_v2 results: {str(e)}")
+                print(f"Warning: Error running DMT_v2 backtest: {e}")
+                import traceback
                 traceback.print_exc()
                 return None, {}
         

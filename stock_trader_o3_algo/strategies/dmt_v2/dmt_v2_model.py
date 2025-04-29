@@ -223,20 +223,26 @@ class StrategyLayer(nn.Module):
         Returns:
             position_t: Position sizing (batch_size,)
         """
-        # Clamp thresholds to a reasonable range [0.3, 0.7]
+        # Clamp thresholds to reasonable range (0.3-0.7)
         theta_L = self.theta_L.clamp(0.3, 0.7)
         theta_S = self.theta_S.clamp(0.3, 0.7)
         
-        # Compute adaptive neutral zone and target vol based on regime
+        # Ensure regime_logits is properly formatted for linear layers
+        if regime_logits.dim() == 1:
+            regime_logits = regime_logits.unsqueeze(0)  # Add batch dimension if missing
+        
+        # Apply softmax to get regime probabilities
+        regime_probs = F.softmax(regime_logits, dim=-1)
+        
         # Slightly smaller neutral zone (less aggressive than before)
-        nz_t = F.softplus(self.nz_lin(regime_logits).squeeze(-1)) * 0.8
+        nz_t = F.softplus(self.nz_lin(regime_probs).squeeze(-1)) * 0.8
         
         # Moderately higher target vol (less aggressive)
-        tau_t = (torch.sigmoid(self.tau_lin(regime_logits)).squeeze(-1) * 0.3 + 0.7) * self.config.tau_max
+        tau_t = (torch.sigmoid(self.tau_lin(regime_probs)).squeeze(-1) * 0.3 + 0.7) * self.config.tau_max
         
         # Dynamic max position based on regime - calculate max position as scalar
         max_pos_scalar = self.config.max_pos
-        max_pos_modifier = (torch.sigmoid(self.max_pos_lin(regime_logits)).squeeze(-1) * 0.4 + 0.7).mean().item()
+        max_pos_modifier = (torch.sigmoid(self.max_pos_lin(regime_probs)).squeeze(-1) * 0.4 + 0.7).mean().item()
         effective_max_pos = max_pos_scalar * max_pos_modifier
         
         # Get steepness factor - slightly increased for sharper transitions
@@ -255,6 +261,19 @@ class StrategyLayer(nn.Module):
         # Normalize signals
         norm_sum = long_sig + short_sig + self.config.eps
         pos_dir = (long_sig / norm_sum) - (short_sig / norm_sum)
+        
+        # Ensure tau_t matches sigma_t's shape
+        if tau_t.shape != sigma_t.shape:
+            if tau_t.dim() == 0 and sigma_t.dim() == 1:
+                # tau_t is scalar, sigma_t is vector
+                tau_t = tau_t.expand_as(sigma_t)
+            elif tau_t.dim() == 1 and sigma_t.dim() == 1 and tau_t.shape[0] != sigma_t.shape[0]:
+                # Both are vectors but with different lengths
+                if tau_t.shape[0] == 1:
+                    tau_t = tau_t.expand_as(sigma_t)
+                else:
+                    # Use the mean of tau_t as a scalar
+                    tau_t = torch.mean(tau_t).expand_as(sigma_t)
         
         # Apply volatility scaling with scalar max position size
         dyn_size = (tau_t / (sigma_t + self.config.eps)).clamp(0, effective_max_pos)
