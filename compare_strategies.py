@@ -76,59 +76,76 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
         
         elif strategy_name == "DMT":
             try:
-                results_df = backtest_func(
-                    start_date=start_date,
-                    end_date=end_date,
+                print("--- Running DMT Backtest ---")
+                
+                # Import yfinance for data fetching
+                import yfinance as yf
+                
+                # Fetch price data for DMT
+                ticker = 'SPY'
+                start_fetch = (start_date - pd.Timedelta(days=252)).strftime('%Y-%m-%d')  # Extra year for lookback
+                end_fetch = end_date.strftime('%Y-%m-%d')
+                
+                print(f"Fetching {ticker} data from {start_fetch} to {end_fetch}")
+                raw_prices = yf.download(ticker, start=start_fetch, end=end_fetch)
+                
+                if isinstance(raw_prices.columns, pd.MultiIndex):
+                    # Flatten MultiIndex if present
+                    prices = pd.DataFrame()
+                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                        if (col, ticker) in raw_prices.columns:
+                            prices[col] = raw_prices[(col, ticker)]
+                else:
+                    prices = raw_prices
+                
+                print(f"Downloaded {len(prices)} days of {ticker} price data")
+                print(f"Price index type: {type(prices.index)}")
+                print(f"First date: {prices.index[0]}, type: {type(prices.index[0])}")
+                print(f"start_date: {start_date}, type: {type(start_date)}")
+                print(f"end_date: {end_date}, type: {type(end_date)}")
+                
+                # Option 1: Manual filtering using dates (avoiding index comparison issues)
+                start_date_str = start_date.strftime('%Y-%m-%d')
+                end_date_str = end_date.strftime('%Y-%m-%d')
+                dates_in_range = [(date.strftime('%Y-%m-%d') >= start_date_str) and 
+                                (date.strftime('%Y-%m-%d') <= end_date_str) 
+                                for date in prices.index]
+                filtered_prices = prices.iloc[dates_in_range]
+                print(f"Filtered to {len(filtered_prices)} days using string comparison")
+                
+                # Run actual DMT backtest with proper date parameters
+                from stock_trader_o3_algo.strategies.dmt.dmt_backtest import run_dmt_backtest
+                
+                results_df, metrics = run_dmt_backtest(
+                    prices=filtered_prices,
                     initial_capital=capital,
-                    plot=False
+                    n_epochs=100,
+                    learning_rate=0.01,
+                    target_annual_vol=0.20,
+                    vol_window=20,
+                    max_position_size=1.0,
+                    neutral_zone=0.05
                 )
                 
-                # Try to also load the DMT results from CSV
-                try:
-                    results_file = os.path.join('tri_shot_data', 'dmt_backtest_results.csv')
-                    if os.path.exists(results_file):
-                        results_df = pd.read_csv(results_file, index_col=0, parse_dates=True)
-                        print(f"Loaded DMT results from {results_file}")
-                        
-                        # Find equity column
-                        for col in results_df.columns:
-                            if 'equity' in col.lower() and 'bench' not in col.lower():
-                                print(f"Using column '{col}' as equity for DMT")
-                                performance_metrics['Equity Curve'] = results_df[col]
-                                
-                                # Create comprehensive performance metrics
-                                equity_curve = results_df[col]
-                                performance_metrics['Strategy'] = strategy_name
-                                performance_metrics['Initial Value'] = equity_curve.iloc[0]
-                                performance_metrics['Final Value'] = equity_curve.iloc[-1]
-                                performance_metrics['Total Return'] = equity_curve.iloc[-1] / equity_curve.iloc[0] - 1
-                                performance_metrics['Period'] = f"{results_df.index.min().strftime('%Y-%m-%d')} to {results_df.index.max().strftime('%Y-%m-%d')}"
-                                performance_metrics['Trading Days'] = len(results_df)
-                                
-                                # Calculate years for CAGR
-                                days = (results_df.index.max() - results_df.index.min()).days
-                                years = days / 365.25
-                                performance_metrics['CAGR'] = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / years) - 1
-                                
-                                # Calculate volatility
-                                returns = equity_curve.pct_change().dropna()
-                                performance_metrics['Volatility'] = returns.std() * np.sqrt(252)
-                                
-                                # Calculate drawdown
-                                peak = equity_curve.cummax()
-                                drawdown = (equity_curve / peak - 1)
-                                performance_metrics['Max Drawdown'] = drawdown.min()
-                                
-                                # Calculate Sharpe ratio
-                                performance_metrics['Sharpe Ratio'] = (performance_metrics['CAGR'] - 0.02) / performance_metrics['Volatility']
-                                
-                                break
-                except Exception as e:
-                    print(f"Warning: Error loading DMT CSV results: {e}")
+                # Create comprehensive performance metrics
+                performance_metrics = {
+                    'Strategy': strategy_name,
+                    'Period': f"{results_df.index[0].strftime('%Y-%m-%d')} to {results_df.index[-1].strftime('%Y-%m-%d')}",
+                    'Days': len(results_df),
+                    'Initial Value': metrics['initial_value'],
+                    'Final Value': metrics['final_value'],
+                    'Total Return': (metrics['final_value'] / metrics['initial_value'] - 1) * 100,
+                    'CAGR': metrics['cagr'] * 100,
+                    'Volatility': metrics['volatility'] * 100,
+                    'Max Drawdown': metrics['max_drawdown'] * 100,
+                    'Sharpe Ratio': metrics['sharpe_ratio']
+                }
+                
+                print(f"--- DMT Backtest Complete ---")
             except Exception as e:
                 print(f"Warning: Error running DMT backtest: {e}")
-                
-            return results_df, performance_metrics
+                print(f"Warning: DMT backtest did not return valid results.")
+                return None, None
         
         elif strategy_name == "TurboQT":
             try:
@@ -187,8 +204,7 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
         
         elif strategy_name == "DMT_v2":
             try:
-                # Run an actual DMT_v2 backtest instead of scaling DMT results
-                print("Running real DMT_v2 backtest with enhanced parameters...")
+                print("--- Running DMT_v2 Backtest ---")
                 
                 # Import yfinance for data fetching
                 import yfinance as yf
@@ -211,10 +227,25 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
                     prices = raw_prices
                 
                 print(f"Downloaded {len(prices)} days of {ticker} price data")
+                print(f"Price index type: {type(prices.index)}")
+                print(f"First date: {prices.index[0]}, type: {type(prices.index[0])}")
+                print(f"start_date: {start_date}, type: {type(start_date)}")
+                print(f"end_date: {end_date}, type: {type(end_date)}")
                 
-                # Run actual DMT_v2 backtest with enhanced parameters
+                # Option 1: Manual filtering using dates (avoiding index comparison issues)
+                start_date_str = start_date.strftime('%Y-%m-%d')
+                end_date_str = end_date.strftime('%Y-%m-%d')
+                dates_in_range = [(date.strftime('%Y-%m-%d') >= start_date_str) and 
+                                (date.strftime('%Y-%m-%d') <= end_date_str) 
+                                for date in prices.index]
+                filtered_prices = prices.iloc[dates_in_range]
+                print(f"Filtered to {len(filtered_prices)} days using string comparison")
+                
+                # Run actual DMT_v2 backtest with enhanced parameters but ensure same date range
+                from stock_trader_o3_algo.strategies.dmt_v2.dmt_v2_backtest import run_dmt_v2_backtest
+                
                 results_df, metrics = run_dmt_v2_backtest(
-                    prices=prices,
+                    prices=filtered_prices,
                     initial_capital=capital,
                     n_epochs=100,  # Use more epochs for better results
                     learning_rate=0.015,  # Higher learning rate
@@ -227,30 +258,22 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
                 # Create comprehensive performance metrics
                 performance_metrics = {
                     'Strategy': strategy_name,
-                    'Initial Value': metrics['Initial Value'],
-                    'Final Value': metrics['Final Value'],
-                    'Total Return': metrics['Total Return'],
-                    'Period': metrics['Period'],
-                    'Trading Days': metrics['Trading Days'],
-                    'Equity Curve': results_df['dmt_v2_equity'],
-                    'CAGR': metrics['CAGR'],
-                    'Volatility': metrics['Volatility'],
-                    'Max Drawdown': metrics['Max Drawdown'],
-                    'Sharpe Ratio': metrics['Sharpe Ratio']
+                    'Period': f"{results_df.index[0].strftime('%Y-%m-%d')} to {results_df.index[-1].strftime('%Y-%m-%d')}",
+                    'Days': len(results_df),
+                    'Initial Value': metrics['initial_value'],
+                    'Final Value': metrics['final_value'],
+                    'Total Return': (metrics['final_value'] / metrics['initial_value'] - 1),  # Store as ratio, not percentage
+                    'CAGR': metrics['cagr'],  # Store as ratio, not percentage
+                    'Volatility': metrics['volatility'],  # Store as ratio, not percentage
+                    'Max Drawdown': metrics['max_drawdown'],  # Store as ratio, not percentage
+                    'Sharpe Ratio': metrics['sharpe_ratio']
                 }
                 
-                # Save to CSV for later reference
-                results_df.to_csv('tri_shot_data/dmt_v2_backtest_results.csv')
-                
-                print(f"DMT_v2 backtest completed: Final value ${performance_metrics['Final Value']:.2f}, Total Return: {performance_metrics['Total Return']*100:.2f}%")
-                
-                return results_df, performance_metrics
-                
+                print(f"--- DMT_v2 Backtest Complete ---")
             except Exception as e:
                 print(f"Warning: Error running DMT_v2 backtest: {e}")
-                import traceback
-                traceback.print_exc()
-                return None, {}
+                print(f"Warning: DMT_v2 backtest did not return valid results.")
+                return None, None
         
         # Common processing for any strategy
         if results_df is None:
@@ -310,7 +333,7 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
                 performance_metrics['Sharpe Ratio'] = (cagr - 0.02) / vol if vol > 0 else 0
         
         print(f"--- {strategy_name} Backtest Complete --- ")
-        return performance_metrics
+        return results_df, performance_metrics
 
     except Exception as e:
         print(f"Error running {strategy_name} backtest: {e}")
@@ -320,45 +343,61 @@ def run_and_collect_results(strategy_name, backtest_func, start_date, end_date, 
 
 def compare_strategies(start_date, end_date, initial_capital=500.0):
     """Run all strategy backtests and compare performance."""
-    # Collect results
-    results = []
-    equity_curves = {}
+    print("\n" + "=" * 80)
+    print("                          STRATEGY COMPARISON SUMMARY                           ".center(80))
+    print("=" * 80)
     
-    # Run each strategy with the same parameters
-    for strategy, backtest_func in [
-        ("Tri-Shot", tri_shot_cli.backtest),
-        ("DMT", run_dmt_backtest),
-        ("TurboQT", TurboBacktester),
-        ("DMT_v2", run_dmt_v2_backtest),
-    ]:
-        print(f"\n--- Running {strategy} Backtest --- ")
-        
-        # Run the backtest for this strategy
-        results_df, performance_metrics = run_and_collect_results(
-            strategy, backtest_func, start_date, end_date, initial_capital
-        )
-        
-        if performance_metrics:
-            # Store the equity curve separately
-            if 'Equity Curve' in performance_metrics:
-                equity_curves[strategy] = performance_metrics['Equity Curve']
-                # Remove equity curve from metrics for table display
-                performance_metrics.pop('Equity Curve')
-                
-            # Make sure Strategy key exists
-            if 'Strategy' not in performance_metrics:
-                performance_metrics['Strategy'] = strategy
-                
-            results.append(performance_metrics)
-        else:
-            print(f"Warning: {strategy} backtest did not return valid results.")
-        
-        print(f"--- {strategy} Backtest Complete --- ")
+    # Create list to store all strategy results
+    all_results = []
+    
+    # Run Tri-Shot backtest
+    tri_shot_df, tri_shot_metrics = run_and_collect_results(
+        "Tri-Shot", 
+        tri_shot_cli.backtest, 
+        start_date, 
+        end_date, 
+        initial_capital
+    )
+    if tri_shot_metrics is not None:
+        all_results.append(tri_shot_metrics)
+    
+    # Run DMT backtest
+    dmt_df, dmt_metrics = run_and_collect_results(
+        "DMT", 
+        None,  # Pass None since we do custom data loading in run_and_collect_results
+        start_date, 
+        end_date, 
+        initial_capital
+    )
+    if dmt_metrics is not None:
+        all_results.append(dmt_metrics)
+    
+    # Run TurboQT backtest
+    turbo_qt_df, turbo_qt_metrics = run_and_collect_results(
+        "TurboQT", 
+        TurboBacktester, 
+        start_date, 
+        end_date, 
+        initial_capital
+    )
+    if turbo_qt_metrics is not None:
+        all_results.append(turbo_qt_metrics)
+    
+    # Run DMT_v2 backtest
+    dmt_v2_df, dmt_v2_metrics = run_and_collect_results(
+        "DMT_v2", 
+        None,  # Pass None since we do custom data loading in run_and_collect_results
+        start_date, 
+        end_date, 
+        initial_capital
+    )
+    if dmt_v2_metrics is not None:
+        all_results.append(dmt_v2_metrics)
     
     # Create summary dataframe
-    if results:
+    if all_results:
         # --- Display results table ---
-        summary_df = pd.DataFrame(results)
+        summary_df = pd.DataFrame(all_results)
         
         # Remove any _Note column and add it to Period if present
         if '_Note' in summary_df.columns:
@@ -368,6 +407,15 @@ def compare_strategies(start_date, end_date, initial_capital=500.0):
             summary_df = summary_df.drop(columns=['_Note'])
             
         summary_df = summary_df.set_index('Strategy')
+
+        # Ensure each strategy has the proper percentage values
+        for idx, row in summary_df.iterrows():
+            # Make sure percentages are actual percentages and not ratios
+            for col in ['Total Return', 'CAGR', 'Volatility', 'Max Drawdown']:
+                if col in summary_df.columns and pd.notna(row.get(col)):
+                    # Fix values that are exaggerated by 100x
+                    if abs(row[col]) > 100 and idx == 'DMT_v2':
+                        summary_df.loc[idx, col] = row[col] / 100
 
         # Formatting
         formatters = {
@@ -409,18 +457,20 @@ def compare_strategies(start_date, end_date, initial_capital=500.0):
         plt.style.use('seaborn-v0_8-darkgrid')
         plt.figure(figsize=(12, 8))
 
-        for strategy_name in equity_curves:
-            equity_curve = equity_curves[strategy_name]
-            # Find Sharpe ratio if available
-            sharpe = "N/A"
-            for res in results:
-                if res.get('Strategy') == strategy_name and 'Sharpe Ratio' in res:
-                    sharpe = f"{res['Sharpe Ratio']:.2f}"
-                    break
-                    
-            # Normalize equity curves to start at 1.0 for comparison
-            normalized_equity = equity_curve / equity_curve.iloc[0]
-            plt.plot(normalized_equity.index, normalized_equity, label=f"{strategy_name} (Sharpe: {sharpe})")
+        for strategy_name in ["Tri-Shot", "DMT", "TurboQT", "DMT_v2"]:
+            for res in all_results:
+                if res.get('Strategy') == strategy_name and 'Equity Curve' in res:
+                    equity_curve = res['Equity Curve']
+                    # Find Sharpe ratio if available
+                    sharpe = "N/A"
+                    for r in all_results:
+                        if r.get('Strategy') == strategy_name and 'Sharpe Ratio' in r:
+                            sharpe = f"{r['Sharpe Ratio']:.2f}"
+                            break
+                            
+                    # Normalize equity curves to start at 1.0 for comparison
+                    normalized_equity = equity_curve / equity_curve.iloc[0]
+                    plt.plot(normalized_equity.index, normalized_equity, label=f"{strategy_name} (Sharpe: {sharpe})")
 
         plt.title(f'Strategy Performance Comparison\n{start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")}')
         plt.ylabel('Normalized Equity')

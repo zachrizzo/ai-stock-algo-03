@@ -189,10 +189,12 @@ def run_dmt_backtest(prices: pd.DataFrame,
                      n_epochs: int = 100,
                      learning_rate: float = 0.01,
                      device: str = 'cpu',
-                     target_annual_vol: float = 0.20, # Added param
-                     vol_window: int = 20,           # Added param
-                     max_position_size: float = 1.0, # Added param
-                     neutral_zone: float = 0.05):    # Added param
+                     target_annual_vol: float = 0.20,
+                     vol_window: int = 20,
+                     max_position_size: float = 1.0,
+                     neutral_zone: float = 0.05,
+                     start_date: Optional[Union[str, pd.Timestamp]] = None,
+                     end_date: Optional[Union[str, pd.Timestamp]] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Run DMT backtest with simplified implementation.
     
@@ -206,25 +208,76 @@ def run_dmt_backtest(prices: pd.DataFrame,
         vol_window: Lookback window for volatility calculation
         max_position_size: Maximum allowed position size (fraction of capital)
         neutral_zone: Zone around 0.5 where trades are avoided
+        start_date: Start date for backtest (optional)
+        end_date: End date for backtest (optional)
         
     Returns:
         Results DataFrame
     """
+    # Filter prices by date range if provided
+    if start_date is not None:
+        if isinstance(start_date, str):
+            start_date = pd.Timestamp(start_date)
+        # Convert index to datetime64 for consistent comparisons
+        prices = prices.copy()
+        prices.index = pd.DatetimeIndex(prices.index)
+        prices = prices[prices.index >= pd.Timestamp(start_date)]
+    
+    if end_date is not None:
+        if isinstance(end_date, str):
+            end_date = pd.Timestamp(end_date)
+        # Ensure index is DatetimeIndex
+        if not isinstance(prices.index, pd.DatetimeIndex):
+            prices.index = pd.DatetimeIndex(prices.index)
+        prices = prices[prices.index <= pd.Timestamp(end_date)]
+        
+    # Check if we have enough data
+    if len(prices) < 60:
+        raise ValueError(f"Not enough price data for DMT backtest. Got {len(prices)} rows after date filtering.")
+    
     print(f"=== Running Simplified DMT Backtest with Vol Scaling ===")
     print(f"Target Vol: {target_annual_vol:.1%}, Window: {vol_window}, Max Size: {max_position_size:.1%}, Neutral Zone: {neutral_zone:.2f}")
     
+    # Ensure the dataframe has the required columns
+    required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    
+    # Check columns and adapt as needed
+    if not all(col in prices.columns for col in required_columns):
+        print("Warning: Not all required columns present in price data")
+        # If we only have Close, we can still work with that
+        if 'Close' in prices.columns:
+            prices = prices.copy()
+            close_prices = prices['Close']
+            for col in required_columns:
+                if col not in prices.columns:
+                    if col == 'Open':
+                        prices[col] = close_prices
+                    elif col == 'High':
+                        prices[col] = close_prices
+                    elif col == 'Low':
+                        prices[col] = close_prices
+                    elif col == 'Volume':
+                        prices[col] = 0  # Dummy volume
+        else:
+            raise ValueError("At minimum, the 'Close' column is required in price data")
+    
+    # Calculate returns if needed
+    if 'returns' not in prices.columns:
+        prices['returns'] = prices['Close'].pct_change()
+        prices = prices.dropna()
+    
     # Create features for traditional model
     print("Preparing features and training traditional model...")
-    X, y = make_feature_matrix(prices, "QQQ")
+    X, y = make_feature_matrix(prices, "SPY")
     
     # Create traditional backtest results
     traditional_model = train_model(prices)
     probabilities = traditional_model.predict_proba(X)[:, 1]
     
     # Calculate returns series matching X (used for PnL in forward pass)
-    returns = prices["QQQ"].pct_change().iloc[len(prices) - len(X):].values
+    returns = prices["Close"].pct_change().iloc[len(prices) - len(X):].values
     # Get raw returns series (Pandas) matching X for vol calculation
-    raw_returns_series = prices["QQQ"].pct_change().iloc[len(prices) - len(X):]
+    raw_returns_series = prices["Close"].pct_change().iloc[len(prices) - len(X):]
     
     # Convert to tensors
     prob_tensor = torch.tensor(probabilities, dtype=torch.float32, device=device)
@@ -313,7 +366,7 @@ def run_dmt_backtest(prices: pd.DataFrame,
     
     # Calculate buy & hold equity
     dates = X.index
-    price_series = prices["QQQ"].reindex(dates)
+    price_series = prices["Close"].reindex(dates)
     buy_hold = initial_capital * price_series / price_series.iloc[0]
     
     # Create results DataFrame

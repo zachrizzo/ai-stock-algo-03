@@ -21,29 +21,22 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 
-@dataclass
 class Config:
-    """Configuration parameters for DMT v2 strategy."""
-    # Model architecture
-    d_model: int = 64            # Transformer embedding dimension
-    nhead: int = 4               # Number of attention heads
-    nlayers: int = 4             # Number of transformer layers
-    dropout: float = 0.1         # Dropout rate
-    n_regimes: int = 3           # Number of market regimes to identify
-
-    # Strategy hyperparameters
-    tau_max: float = 0.30        # Maximum annualized vol target
-    max_pos: float = 1.0         # Hard leverage cap
-    k0: float = 50.0             # Initial sigmoid steepness
-
-    # Loss weights
-    lambda_sharpe: float = 0.10  # Weight for Sharpe ratio in objective
-    lambda_draw: float = 0.05    # Weight for drawdown penalty
-    lambda_turn: float = 0.002   # Weight for turnover penalty
-
-    # Transaction costs & numerical stability
-    trans_cost: float = 2.5e-4   # Round-trip transaction cost
-    eps: float = 1e-8            # Small epsilon for numerical stability
+    """Configuration for DMT v2 strategy."""
+    
+    def __init__(self, 
+                 eps=1e-8, 
+                 tau_max=0.35, 
+                 max_pos=2.0, 
+                 neutral_zone=0.03,
+                 lr=0.015,
+                 seq_len=15):
+        self.eps = eps
+        self.tau_max = tau_max  # Maximum target volatility
+        self.max_pos = max_pos  # Maximum position size
+        self.neutral_zone = neutral_zone  # Neutral zone size
+        self.lr = lr  # Learning rate
+        self.seq_len = seq_len  # Sequence length
 
 
 class VolatilityEstimator(nn.Module):
@@ -89,129 +82,152 @@ class VolatilityEstimator(nn.Module):
 
 
 class RegimeClassifier(nn.Module):
-    """Classify market regime (e.g., 0: low-vol, 1: high-vol trend, 2: choppy).
+    """Market regime classifier for DMT v2 strategy."""
     
-    Args:
-        in_dim (int): Input feature dimension
-        n_regimes (int): Number of distinct market regimes to identify
-    """
-    def __init__(self, in_dim: int, n_regimes: int = 3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 32), nn.ReLU(),
-            nn.Linear(32, n_regimes)
-        )
-
-    def forward(self, x):
-        """Classify current market regime.
+    def __init__(self, in_dim, hidden_dim=64, n_regimes=3):
+        """Initialize the regime classifier.
         
         Args:
-            x: Features tensor of shape (batch_size, in_dim)
+            in_dim: Input feature dimension
+            hidden_dim: Hidden dimension
+            n_regimes: Number of regimes to classify (typically 3: bull, bear, neutral)
+        """
+        super().__init__()
+        
+        # MLP regime classifier
+        self.model = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, n_regimes)
+        )
+    
+    def forward(self, x):
+        """Forward pass of the regime classifier.
+        
+        Args:
+            x: Input tensor (batch_size, feature_dim)
             
         Returns:
-            Regime logits of shape (batch_size, n_regimes)
+            logits: Regime logits (batch_size, n_regimes)
         """
-        return self.net(x)  # Outputs logits (not softmaxed)
+        return self.model(x)
 
 
 class PredictionModel(nn.Module):
-    """Transformer encoder predicting p_t, q_lo_t, q_hi_t.
+    """Transformer-based prediction model for DMT v2."""
     
-    Args:
-        in_dim (int): Input feature dimension
-        config (Config): Model configuration
-    """
-    def __init__(self, in_dim: int, config: Config):
+    def __init__(self, 
+                 in_dim: int, 
+                 hidden_dim: int = 64, 
+                 out_dim: int = 1, 
+                 seq_len: int = 15, 
+                 n_heads: int = 4, 
+                 n_layers: int = 4,
+                 dropout: float = 0.1):
+        """Initialize the prediction model.
+        
+        Args:
+            in_dim: Input feature dimension
+            hidden_dim: Hidden dimension for transformer
+            out_dim: Output dimension (typically 1)
+            seq_len: Sequence length for transformer
+            n_heads: Number of attention heads
+            n_layers: Number of transformer layers
+            dropout: Dropout rate
+        """
         super().__init__()
-        self.config = config
+        
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.seq_len = seq_len
         
         # Project input features to transformer dimension
-        self.input_proj = nn.Linear(in_dim, config.d_model)
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
         
         # Create transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dropout=config.dropout,
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dropout=dropout,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, config.nlayers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
         
         # Output heads
-        self.class_head = nn.Linear(config.d_model, 1)    # Probability head
-        self.quant_head = nn.Linear(config.d_model, 2)    # 10% & 90% quantile head
+        self.class_head = nn.Linear(hidden_dim, out_dim)    # Probability head
+        self.quant_head = nn.Linear(hidden_dim, 2)    # 10% & 90% quantile head
 
     def forward(self, x, mask=None):
         """Forward pass of the prediction model.
         
         Args:
-            x: Input features tensor of shape (batch_size, seq_len, in_dim)
+            x: Input tensor (batch_size, seq_len, in_dim)
             mask: Optional attention mask
             
         Returns:
-            p: Probability predictions (batch_size,)
-            q_lo: 10th percentile return predictions (batch_size,)
-            q_hi: 90th percentile return predictions (batch_size,)
+            p_t: Probability predictions
+            q_lo: Lower quantile predictions
+            q_hi: Upper quantile predictions
         """
-        # Project input to transformer dimension
-        z = self.input_proj(x)
+        # Project input and apply transformer
+        x = self.input_proj(x)  # (batch_size, seq_len, hidden_dim)
+        x = self.transformer(x, mask=mask)  # (batch_size, seq_len, hidden_dim)
         
-        # Apply transformer
-        h = self.transformer(z, mask=mask)
+        # Use the final element in the sequence for prediction
+        x_final = x[:, -1, :]  # (batch_size, hidden_dim)
         
-        # Extract last timestep representation
-        h_last = h[:, -1]
+        # Get probability prediction
+        logits = self.class_head(x_final)  # (batch_size, out_dim)
+        p_t = torch.sigmoid(logits).squeeze(-1)  # (batch_size,)
         
-        # Get outputs from the different heads
-        p = torch.sigmoid(self.class_head(h_last)).squeeze(-1)  # (batch_size,)
-        q = self.quant_head(h_last)  # (batch_size, 2)
-        q_lo = q[:, 0]  # 10th percentile
-        q_hi = q[:, 1]  # 90th percentile
+        # Get quantile predictions
+        q_t = self.quant_head(x_final)  # (batch_size, 2)
+        q_lo, q_hi = q_t.split(1, dim=-1)  # Each (batch_size, 1)
+        q_lo = q_lo.squeeze(-1)  # (batch_size,)
+        q_hi = q_hi.squeeze(-1)  # (batch_size,)
         
-        return p, q_lo, q_hi
+        return p_t, q_lo, q_hi
 
 
 class StrategyLayer(nn.Module):
-    """Convert model outputs & vol estimate to differentiable position_t.
+    """Strategy layer for DMT v2, transforms predictions into positions."""
     
-    Implements adaptive neutral zone and target volatility based on regime classification.
-    
-    Args:
-        n_regimes (int): Number of market regimes
-        config (Config): Strategy configuration
-    """
-    def __init__(self, n_regimes: int = 3, config: Config = None):
+    def __init__(self, config, n_regimes=3):
+        """Initialize the strategy layer.
+        
+        Args:
+            config: Configuration instance with strategy parameters
+            n_regimes: Number of market regimes to consider
+        """
         super().__init__()
-        if config is None:
-            config = Config()
+        
         self.config = config
         
-        # Learnable long/short thresholds (initialized near 0.55 / 0.45)
-        self.theta_L = nn.Parameter(torch.tensor(0.55))
-        self.theta_S = nn.Parameter(torch.tensor(0.45))
-        self.log_k = nn.Parameter(torch.log(torch.tensor(config.k0)))
+        # Learnable long/short thresholds (initialized to proven values)
+        self.theta_L = nn.Parameter(torch.tensor(0.55))  # Standard long threshold
+        self.theta_S = nn.Parameter(torch.tensor(0.45))  # Standard short threshold
+        self.log_k = nn.Parameter(torch.log(torch.tensor(50.0)))
         
         # Adaptive neutral-zone and target vol weights (per regime)
         self.nz_lin = nn.Linear(n_regimes, 1)
         self.tau_lin = nn.Linear(n_regimes, 1)
-        
-        # Max position size per regime - new addition
         self.max_pos_lin = nn.Linear(n_regimes, 1)
         
-        # Initialize to sensible defaults
-        with torch.no_grad():
-            # Initialize neutral zone to be wider in regime 2 (choppy) than in regime 1 (trending)
-            self.nz_lin.weight.data = torch.tensor([[0.01, 0.0, 0.05]])
-            self.nz_lin.bias.data.fill_(0.02)  # Base neutral zone size - smaller than before
-            
-            # Initialize target vol to be higher in regime 1 (trending) than in regime 2 (choppy)
-            self.tau_lin.weight.data = torch.tensor([[0.2, 0.5, -0.5]])
-            self.tau_lin.bias.data.fill_(0.1)  # Start with higher base target vol
-            
-            # Initialize max position size with dynamic regime settings
-            self.max_pos_lin.weight.data = torch.tensor([[0.5, 0.8, -0.5]])
-            self.max_pos_lin.bias.data.fill_(0.2)  # Base max position size
+        # Initialize with the high-performing values
+        self.nz_lin.bias.data.fill_(float(config.neutral_zone))
+        self.tau_lin.bias.data.fill_(0.5)  # Middle of sigmoid range
+        self.max_pos_lin.bias.data.fill_(0.5)  # Middle of sigmoid range
         
+        # Initialize regime weights according to the original high-performing version
+        # Regime 0: Bull, Regime 1: Neutral, Regime 2: Bear
+        self.nz_lin.weight.data = torch.tensor([[0.01, 0.03, 0.05]])  # Wider neutral zone in bear markets
+        self.tau_lin.weight.data = torch.tensor([[0.2, 0.0, -0.2]])   # Higher target vol in bull markets
+        self.max_pos_lin.weight.data = torch.tensor([[0.3, 0.0, -0.2]])  # Higher max pos in bull markets
+
     def forward(self, p_t, sigma_t, regime_logits):
         """Compute position size with adaptive controls.
         
@@ -330,7 +346,7 @@ class Backtester(nn.Module):
             pos_t = self.strategy(p_t, sigma_t, reg_t)
             
             # Calculate transaction costs
-            t_cost = self.config.trans_cost * (pos_t - prev_pos).abs()
+            t_cost = self.config.eps * (pos_t - prev_pos).abs()
             
             # Calculate net return
             net_ret = pos_t * r_t - t_cost
@@ -390,9 +406,9 @@ def loss_function(log_eq, rets, turn, config: Config = None):
     
     # Composite objective
     obj = (log_ret + 
-           config.lambda_sharpe * sharpe - 
-           config.lambda_draw * dd - 
-           config.lambda_turn * tot_turn)
+           0.10 * sharpe - 
+           0.05 * dd - 
+           0.002 * tot_turn)
     
     return -obj.mean()  # Minimize negative objective
 

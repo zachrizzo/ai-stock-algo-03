@@ -13,72 +13,77 @@ from stock_trader_o3_algo.config.settings import TZ # Import TZ from settings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-def make_feature_matrix(prices: pd.DataFrame, 
-                        target_ticker: str = "QQQ", 
-                        lookback_days: int = 300,
-                        handle_nans: str = 'drop') -> Tuple[pd.DataFrame, pd.Series]:
+def make_feature_matrix(df, ticker_name="QQQ", window=20, target_days=1, feat_threshold=0.0, handle_nans='drop'):
     """
-    Create feature matrix and target labels for the ML model.
+    Create machine learning feature matrix for the tri-shot strategy.
     
     Args:
-        prices: DataFrame with price data for all tickers
-        target_ticker: Ticker to predict (usually QQQ)
-        lookback_days: Number of days to use for feature creation
+        df: DataFrame with OHLCV data
+        ticker_name: Name of the ticker column (e.g., "QQQ", "SPY") - used for backward compatibility
+        window: Window for rolling calculations
+        target_days: Days ahead for prediction target
+        feat_threshold: Correlation threshold for feature filtering
         handle_nans: How to handle NaN values: 'drop' to remove them (default),
                     'fill_zeros' to replace with zeros, or 'fill_means' to use feature means
         
     Returns:
         X: Feature matrix
-        y: Target labels (1 for up, 0 for down)
+        y: Target vector
     """
-    df = prices.copy()
+    # Ensure we have all required data
+    price_col = 'Close'  # Default to using Close price
+    if ticker_name in df.columns:
+        price_col = ticker_name
+    
+    # Make a copy to avoid modifying the original
+    df = df.copy()
     
     # Target creation: 5-day forward returns
-    df[f'{target_ticker}_fwd_5d_ret'] = df[target_ticker].shift(-5) / df[target_ticker] - 1
+    df[f'{ticker_name}_fwd_{target_days}d_ret'] = df[price_col].shift(-target_days) / df[price_col] - 1
     
     # Create binary labels (0 for down, 1 for up)
-    df['target'] = np.where(df[f'{target_ticker}_fwd_5d_ret'] >= 0, 1, 0)
+    df['target'] = np.where(df[f'{ticker_name}_fwd_{target_days}d_ret'] >= 0, 1, 0)
     
     # ------ ENHANCE FEATURE SET ------
     
     # 1. Price momentum - standard lookbacks
     for days in [5, 10, 21, 63]:
-        df[f'{target_ticker}_mom_{days}d'] = df[target_ticker].pct_change(days)
+        df[f'{ticker_name}_mom_{days}d'] = df[price_col].pct_change(days)
     
     # 2. Kelly slope - slope of log-price vs sqrt(t)
     # This captures convexity in price movement
-    log_price = np.log(df[target_ticker])
+    log_price = np.log(df[price_col])
     for days in [10, 21]:
         kelly_y = log_price.rolling(window=days).apply(lambda x: np.polyfit(np.sqrt(np.arange(1, len(x)+1)), x, 1)[0], raw=False)
-        df[f'{target_ticker}_kelly_{days}d'] = kelly_y
+        df[f'{ticker_name}_kelly_{days}d'] = kelly_y
     
     # 3. Efficiency Ratio - measures trend quality
     # High ER means price is moving efficiently, low ER means choppy/noisy
     for days in [10, 21]:
         # Numerator: net directional move
-        net_move = (df[target_ticker] - df[target_ticker].shift(days)).abs()
+        net_move = (df[price_col] - df[price_col].shift(days)).abs()
         # Denominator: sum of all price movements (path length)
-        path_length = df[target_ticker].diff().abs().rolling(days).sum()
+        path_length = df[price_col].diff().abs().rolling(days).sum()
         # ER = directional move / path length
-        df[f'{target_ticker}_eff_ratio_{days}d'] = net_move / path_length
+        df[f'{ticker_name}_eff_ratio_{days}d'] = net_move / path_length
     
     # 4. Volatility measures
-    df[f'{target_ticker}_vol_5d'] = df[target_ticker].pct_change().rolling(5).std() * np.sqrt(252)
-    df[f'{target_ticker}_vol_20d'] = df[target_ticker].pct_change().rolling(20).std() * np.sqrt(252)
+    df[f'{ticker_name}_vol_5d'] = df[price_col].pct_change().rolling(5).std() * np.sqrt(252)
+    df[f'{ticker_name}_vol_20d'] = df[price_col].pct_change().rolling(20).std() * np.sqrt(252)
     
     # 5. Higher-order moments: skew and kurtosis
     for days in [10, 20]:
-        df[f'{target_ticker}_skew_{days}d'] = df[target_ticker].pct_change().rolling(days).skew()
-        df[f'{target_ticker}_kurt_{days}d'] = df[target_ticker].pct_change().rolling(days).kurt()
+        df[f'{ticker_name}_skew_{days}d'] = df[price_col].pct_change().rolling(days).skew()
+        df[f'{ticker_name}_kurt_{days}d'] = df[price_col].pct_change().rolling(days).kurt()
     
     # 6. Correlation-cluster break indicator
     # Positive correlation between QQQ and VIX often signals regime change
     if '^VIX' in df.columns:
         for days in [10, 20]:
-            rolling_corr = df[target_ticker].pct_change().rolling(days).corr(df['^VIX'].pct_change())
-            df[f'{target_ticker}_vix_corr_{days}d'] = rolling_corr
+            rolling_corr = df[price_col].pct_change().rolling(days).corr(df['^VIX'].pct_change())
+            df[f'{ticker_name}_vix_corr_{days}d'] = rolling_corr
             # Signal = 1 when correlation turns positive (risk-off)
-            df[f'{target_ticker}_vix_corr_pos_{days}d'] = np.where(rolling_corr > 0, 1, 0)
+            df[f'{ticker_name}_vix_corr_pos_{days}d'] = np.where(rolling_corr > 0, 1, 0)
     
     # 7. ATR - measure of volatility that accounts for gaps
     def calc_atr(high, low, close, window=14):
@@ -89,52 +94,52 @@ def make_feature_matrix(prices: pd.DataFrame,
         return tr.rolling(window).mean()
     
     # If we have high/low data
-    if isinstance(df, pd.DataFrame) and all(col in df.columns for col in [f'{target_ticker}_High', f'{target_ticker}_Low']):
-        df[f'{target_ticker}_atr_14d'] = calc_atr(df[f'{target_ticker}_High'], df[f'{target_ticker}_Low'], df[target_ticker], 14)
+    if isinstance(df, pd.DataFrame) and all(col in df.columns for col in [f'{ticker_name}_High', f'{ticker_name}_Low']):
+        df[f'{ticker_name}_atr_14d'] = calc_atr(df[f'{ticker_name}_High'], df[f'{ticker_name}_Low'], df[price_col], 14)
     else:
         # Simplified ATR using only close prices
-        df[f'{target_ticker}_atr_14d'] = df[target_ticker].pct_change().abs().rolling(14).mean() * df[target_ticker]
+        df[f'{ticker_name}_atr_14d'] = df[price_col].pct_change().abs().rolling(14).mean() * df[price_col]
     
     # 8. Money flow - volume-weighted price change
-    if f'{target_ticker}_Volume' in df.columns:
-        price_change = df[target_ticker].pct_change()
-        volume = df[f'{target_ticker}_Volume']
-        df[f'{target_ticker}_money_flow_1d'] = price_change * volume
-        df[f'{target_ticker}_money_flow_5d'] = df[f'{target_ticker}_money_flow_1d'].rolling(5).sum()
+    if f'{ticker_name}_Volume' in df.columns:
+        price_change = df[price_col].pct_change()
+        volume = df[f'{ticker_name}_Volume']
+        df[f'{ticker_name}_money_flow_1d'] = price_change * volume
+        df[f'{ticker_name}_money_flow_5d'] = df[f'{ticker_name}_money_flow_1d'].rolling(5).sum()
     
     # 9. EMAs and regime filters
     for days in [8, 21, 50, 200]:
-        df[f'{target_ticker}_ema_{days}'] = df[target_ticker].ewm(span=days).mean()
-        df[f'{target_ticker}_vs_ema_{days}'] = df[target_ticker] / df[f'{target_ticker}_ema_{days}'] - 1
+        df[f'{ticker_name}_ema_{days}'] = df[price_col].ewm(span=days).mean()
+        df[f'{ticker_name}_vs_ema_{days}'] = df[price_col] / df[f'{ticker_name}_ema_{days}'] - 1
     
     # 10. EMA crossovers
-    df[f'{target_ticker}_ema_8_21_cross'] = np.where(
-        df[f'{target_ticker}_ema_8'] > df[f'{target_ticker}_ema_21'], 1, -1
+    df[f'{ticker_name}_ema_8_21_cross'] = np.where(
+        df[f'{ticker_name}_ema_8'] > df[f'{ticker_name}_ema_21'], 1, -1
     )
-    df[f'{target_ticker}_ema_50_200_cross'] = np.where(
-        df[f'{target_ticker}_ema_50'] > df[f'{target_ticker}_ema_200'], 1, -1
+    df[f'{ticker_name}_ema_50_200_cross'] = np.where(
+        df[f'{ticker_name}_ema_50'] > df[f'{ticker_name}_ema_200'], 1, -1
     )
     
     # 11. MACD
-    df[f'{target_ticker}_ema_12'] = df[target_ticker].ewm(span=12).mean()
-    df[f'{target_ticker}_ema_26'] = df[target_ticker].ewm(span=26).mean()
-    df[f'{target_ticker}_macd'] = df[f'{target_ticker}_ema_12'] - df[f'{target_ticker}_ema_26']
-    df[f'{target_ticker}_macd_signal'] = df[f'{target_ticker}_macd'].ewm(span=9).mean()
-    df[f'{target_ticker}_macd_hist'] = df[f'{target_ticker}_macd'] - df[f'{target_ticker}_macd_signal']
-    df[f'{target_ticker}_macd_hist_chg'] = df[f'{target_ticker}_macd_hist'].pct_change(3)
+    df[f'{ticker_name}_ema_12'] = df[price_col].ewm(span=12).mean()
+    df[f'{ticker_name}_ema_26'] = df[price_col].ewm(span=26).mean()
+    df[f'{ticker_name}_macd'] = df[f'{ticker_name}_ema_12'] - df[f'{ticker_name}_ema_26']
+    df[f'{ticker_name}_macd_signal'] = df[f'{ticker_name}_macd'].ewm(span=9).mean()
+    df[f'{ticker_name}_macd_hist'] = df[f'{ticker_name}_macd'] - df[f'{ticker_name}_macd_signal']
+    df[f'{ticker_name}_macd_hist_chg'] = df[f'{ticker_name}_macd_hist'].pct_change(3)
     
     # 12. RSI
-    delta = df[target_ticker].diff()
+    delta = df[price_col].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
-    df[f'{target_ticker}_rsi'] = 100 - (100 / (1 + rs))
+    df[f'{ticker_name}_rsi'] = 100 - (100 / (1 + rs))
     
     # RSI divergence
-    df[f'{target_ticker}_rsi_div'] = (df[target_ticker].pct_change(5).rolling(5).mean() - 
-                                     df[f'{target_ticker}_rsi'].pct_change(5).rolling(5).mean())
+    df[f'{ticker_name}_rsi_div'] = (df[price_col].pct_change(5).rolling(5).mean() - 
+                                     df[f'{ticker_name}_rsi'].pct_change(5).rolling(5).mean())
     
     # 13. VIX-based features
     if '^VIX' in df.columns:
@@ -158,7 +163,7 @@ def make_feature_matrix(prices: pd.DataFrame,
         df['tlt_vol_20d'] = df['TLT'].pct_change().rolling(20).std() * np.sqrt(252)
         
         # TLT vs QQQ relative strength
-        df['tlt_qqq_rs_20d'] = df['TLT'].pct_change(20) - df[target_ticker].pct_change(20)
+        df['tlt_qqq_rs_20d'] = df['TLT'].pct_change(20) - df[price_col].pct_change(20)
     else:
         # Create placeholder with zeros if TLT is not available
         df['tlt_mom_20d'] = 0.0
@@ -183,17 +188,17 @@ def make_feature_matrix(prices: pd.DataFrame,
             df[f'month_{i}'] = np.where(df['month'] == i, 1, 0)
     
     # 17. Technical "overbought/oversold" signals
-    df[f'{target_ticker}_overbought'] = np.where(df[f'{target_ticker}_rsi'] > 70, 1, 0)
-    df[f'{target_ticker}_oversold'] = np.where(df[f'{target_ticker}_rsi'] < 30, 1, 0)
+    df[f'{ticker_name}_overbought'] = np.where(df[f'{ticker_name}_rsi'] > 70, 1, 0)
+    df[f'{ticker_name}_oversold'] = np.where(df[f'{ticker_name}_rsi'] < 30, 1, 0)
     
     # 18. Volatility regime
-    df['vol_regime'] = np.where(df[f'{target_ticker}_vol_20d'] > df[f'{target_ticker}_vol_20d'].rolling(63).mean(), 1, 0)
+    df['vol_regime'] = np.where(df[f'{ticker_name}_vol_20d'] > df[f'{ticker_name}_vol_20d'].rolling(63).mean(), 1, 0)
     
     # Drop rows with NaN targets (typically the last 5 rows)
     df = df.dropna(subset=['target'])
     
     # Get all features for modeling
-    feature_cols = [col for col in df.columns if col != 'target' and col != f'{target_ticker}_fwd_5d_ret'
+    feature_cols = [col for col in df.columns if col != 'target' and col != f'{ticker_name}_fwd_{target_days}d_ret'
                    and not any(c in col for c in ['Open', 'High', 'Low', 'Close', 'Volume', 'date'])]
     
     # Handle NaN values in features based on the selected strategy
