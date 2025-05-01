@@ -118,15 +118,15 @@ class RegimeClassifier(nn.Module):
 
 
 class PredictionModel(nn.Module):
-    """Transformer-based prediction model for DMT v2."""
+    """Transformer-based prediction model for DMT v2 with multi-timeframe support."""
     
     def __init__(self, 
                  in_dim: int, 
-                 hidden_dim: int = 64, 
+                 hidden_dim: int = 96, 
                  out_dim: int = 1, 
                  seq_len: int = 15, 
-                 n_heads: int = 4, 
-                 n_layers: int = 4,
+                 n_heads: int = 6,
+                 n_layers: int = 5,
                  dropout: float = 0.1):
         """Initialize the prediction model.
         
@@ -145,27 +145,71 @@ class PredictionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.seq_len = seq_len
         
-        # Project input features to transformer dimension
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        # Make sure each transformer's hidden dimension is divisible by the number of heads
+        # For 96 hidden_dim and 6 heads, we use 32 dims per timeframe (32*3=96, 32 is divisible by 2 heads)
+        frames_hidden = 32  # Per-timeframe hidden dimension
+        per_frame_heads = 2  # Heads per timeframe, must evenly divide frames_hidden
         
-        # Create transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
+        # Project input features to transformer dimension for each timeframe
+        self.short_proj = nn.Linear(in_dim, frames_hidden)
+        self.med_proj = nn.Linear(in_dim, frames_hidden)
+        self.long_proj = nn.Linear(in_dim, frames_hidden)
+        
+        self.short_norm = nn.LayerNorm(frames_hidden)
+        self.med_norm = nn.LayerNorm(frames_hidden)
+        self.long_norm = nn.LayerNorm(frames_hidden)
+        
+        # Dropout layers
+        self.input_dropout = nn.Dropout(dropout)
+        
+        # Transformer encoder for each timeframe
+        short_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=frames_hidden,
+            nhead=per_frame_heads,
+            dim_feedforward=frames_hidden * 4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, n_layers)
+        
+        med_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=frames_hidden,
+            nhead=per_frame_heads,
+            dim_feedforward=frames_hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        
+        long_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=frames_hidden,
+            nhead=per_frame_heads,
+            dim_feedforward=frames_hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        
+        self.short_transformer = nn.TransformerEncoder(short_encoder_layer, n_layers // 2)
+        self.med_transformer = nn.TransformerEncoder(med_encoder_layer, n_layers)
+        self.long_transformer = nn.TransformerEncoder(long_encoder_layer, n_layers // 2)
+        
+        # Output projection after concatenating transformer outputs (3 * frames_hidden = combined dimension)
+        self.output_linear = nn.Linear(frames_hidden * 3, hidden_dim)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_dropout = nn.Dropout(dropout)
         
         # Output heads
-        self.class_head = nn.Linear(hidden_dim, out_dim)    # Probability head
-        self.quant_head = nn.Linear(hidden_dim, 2)    # 10% & 90% quantile head
-
-    def forward(self, x, mask=None):
+        self.class_head = nn.Linear(hidden_dim, out_dim)
+        self.quant_head = nn.Linear(hidden_dim, 2)
+    
+    def forward(self, x_short, x_med=None, x_long=None, mask=None):
         """Forward pass of the prediction model.
         
         Args:
-            x: Input tensor (batch_size, seq_len, in_dim)
+            x_short: Short-term input tensor (batch_size, short_seq_len, in_dim)
+            x_med: Medium-term input tensor (batch_size, med_seq_len, in_dim)
+            x_long: Long-term input tensor (batch_size, long_seq_len, in_dim)
             mask: Optional attention mask
             
         Returns:
@@ -173,22 +217,50 @@ class PredictionModel(nn.Module):
             q_lo: Lower quantile predictions
             q_hi: Upper quantile predictions
         """
-        # Project input and apply transformer
-        x = self.input_proj(x)  # (batch_size, seq_len, hidden_dim)
-        x = self.transformer(x, mask=mask)  # (batch_size, seq_len, hidden_dim)
+        # Process short timeframe
+        short_out = self.short_proj(x_short)
+        short_out = self.short_norm(short_out)
+        short_out = self.input_dropout(short_out)
+        short_out = self.short_transformer(short_out, mask=mask)
+        short_feat = short_out[:, -1, :]  # Use final timestep features
         
-        # Use the final element in the sequence for prediction
-        x_final = x[:, -1, :]  # (batch_size, hidden_dim)
+        # If medium timeframe is provided
+        if x_med is not None:
+            med_out = self.med_proj(x_med)
+            med_out = self.med_norm(med_out)
+            med_out = self.input_dropout(med_out)
+            med_out = self.med_transformer(med_out, mask=mask)
+            med_feat = med_out[:, -1, :]
+        else:
+            med_feat = short_feat  # Fallback
+            
+        # If long timeframe is provided
+        if x_long is not None:
+            long_out = self.long_proj(x_long)
+            long_out = self.long_norm(long_out)
+            long_out = self.input_dropout(long_out)
+            long_out = self.long_transformer(long_out, mask=mask)
+            long_feat = long_out[:, -1, :]
+        else:
+            long_feat = med_feat  # Fallback
+            
+        # Concatenate features from all timeframes
+        combined_feat = torch.cat([short_feat, med_feat, long_feat], dim=1)
+        
+        # Project to single vector and apply norm/dropout
+        output = self.output_linear(combined_feat)
+        output = self.output_norm(output)
+        output = self.output_dropout(output)
         
         # Get probability prediction
-        logits = self.class_head(x_final)  # (batch_size, out_dim)
-        p_t = torch.sigmoid(logits).squeeze(-1)  # (batch_size,)
+        logits = self.class_head(output)
+        p_t = torch.sigmoid(logits).squeeze(-1)
         
         # Get quantile predictions
-        q_t = self.quant_head(x_final)  # (batch_size, 2)
-        q_lo, q_hi = q_t.split(1, dim=-1)  # Each (batch_size, 1)
-        q_lo = q_lo.squeeze(-1)  # (batch_size,)
-        q_hi = q_hi.squeeze(-1)  # (batch_size,)
+        q_t = self.quant_head(output)
+        q_lo, q_hi = q_t.split(1, dim=-1)
+        q_lo = q_lo.squeeze(-1)
+        q_hi = q_hi.squeeze(-1)
         
         return p_t, q_lo, q_hi
 
