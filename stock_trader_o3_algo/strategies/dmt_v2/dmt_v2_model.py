@@ -28,15 +28,31 @@ class Config:
                  eps=1e-8, 
                  tau_max=0.35, 
                  max_pos=2.0, 
-                 neutral_zone=0.03,
+                 neutral_zone=0.025,  
                  lr=0.015,
-                 seq_len=15):
+                 seq_len=15,
+                 max_drawdown_threshold=0.2,  
+                 risk_scaling_factor=0.6,  
+                 uncertainty_threshold=0.25,  
+                 use_ensemble=True,
+                 use_dynamic_stops=True,
+                 stop_loss_atr_multiple=2.5,  
+                 use_regime_detection=True,
+                 regime_smoothing_window=3):  
         self.eps = eps
-        self.tau_max = tau_max  # Maximum target volatility
-        self.max_pos = max_pos  # Maximum position size
-        self.neutral_zone = neutral_zone  # Neutral zone size
-        self.lr = lr  # Learning rate
-        self.seq_len = seq_len  # Sequence length
+        self.tau_max = tau_max
+        self.max_pos = max_pos
+        self.neutral_zone = neutral_zone
+        self.lr = lr
+        self.seq_len = seq_len
+        self.max_drawdown_threshold = max_drawdown_threshold
+        self.risk_scaling_factor = risk_scaling_factor
+        self.uncertainty_threshold = uncertainty_threshold
+        self.use_ensemble = use_ensemble
+        self.use_dynamic_stops = use_dynamic_stops
+        self.stop_loss_atr_multiple = stop_loss_atr_multiple
+        self.use_regime_detection = use_regime_detection
+        self.regime_smoothing_window = regime_smoothing_window
 
 
 class VolatilityEstimator(nn.Module):
@@ -82,39 +98,103 @@ class VolatilityEstimator(nn.Module):
 
 
 class RegimeClassifier(nn.Module):
-    """Market regime classifier for DMT v2 strategy."""
+    """Market regime classifier for DMT v2 strategy with enhanced indicators."""
     
-    def __init__(self, in_dim, hidden_dim=64, n_regimes=3):
+    def __init__(self, in_dim, hidden_dim=96, n_regimes=3, smoothing_window=3):
         """Initialize the regime classifier.
         
         Args:
             in_dim: Input feature dimension
             hidden_dim: Hidden dimension
             n_regimes: Number of regimes to classify (typically 3: bull, bear, neutral)
+            smoothing_window: Window size for regime probability smoothing
         """
         super().__init__()
         
-        # MLP regime classifier
-        self.model = nn.Sequential(
+        self.smoothing_window = smoothing_window
+        self.n_regimes = n_regimes
+        
+        # Feature extraction layers
+        self.feature_extractor = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, n_regimes)
         )
-    
-    def forward(self, x):
+        
+        # Enhanced VIX processor with increased capacity
+        self.vix_processor = nn.Sequential(
+            nn.Linear(1, 24),
+            nn.ReLU(),
+            nn.Linear(24, 12)
+        )
+        
+        # Increased combined dimension
+        self.regime_head = nn.Linear(hidden_dim // 2 + 12, n_regimes)
+        self.regime_history = []
+        
+        # Add a momentum layer to better identify trend direction
+        self.momentum_processor = nn.Sequential(
+            nn.Linear(5, 16),  # Process 5 recent returns
+            nn.ReLU(),
+            nn.Linear(16, 8)
+        )
+        
+    def forward(self, x, vix=None):
         """Forward pass of the regime classifier.
         
         Args:
             x: Input tensor (batch_size, feature_dim)
+            vix: VIX feature tensor (batch_size, 1)
             
         Returns:
             logits: Regime logits (batch_size, n_regimes)
         """
-        return self.model(x)
+        # Process the main features
+        features = self.feature_extractor(x)
+        
+        # Process VIX data if available
+        if vix is not None:
+            vix_features = self.vix_processor(vix)
+            features = torch.cat([features, vix_features], dim=1)
+        
+        # Calculate regime probabilities
+        regime_logits = self.regime_head(features)
+        regime_probs = F.softmax(regime_logits, dim=1)
+        
+        # Apply smoothing if we have history
+        if len(self.regime_history) > 0:
+            # Calculate exponential moving average weight for new data
+            # More aggressive smoothing with recent regime having more weight
+            alpha = 0.6  # Increased from default value to be more responsive
+            
+            # Get previous regime probabilities
+            prev_probs = self.regime_history[-1]
+            
+            # Apply exponential smoothing
+            smoothed_probs = alpha * regime_probs + (1 - alpha) * prev_probs
+            
+            # Normalize to ensure they sum to 1
+            smoothed_probs = smoothed_probs / smoothed_probs.sum(dim=1, keepdim=True)
+            regime_probs = smoothed_probs
+        
+        # Store regime probabilities for future smoothing
+        self.regime_history.append(regime_probs.detach())
+        
+        # Only keep the most recent smoothing_window entries
+        if len(self.regime_history) > self.smoothing_window:
+            self.regime_history.pop(0)
+            
+        return regime_logits
+        
+    def get_regime_probs(self):
+        # Return the most recent smoothed regime probabilities
+        if len(self.regime_history) > 0:
+            return self.regime_history[-1]
+        else:
+            return torch.ones(1, self.n_regimes) / self.n_regimes
 
 
 class PredictionModel(nn.Module):
@@ -263,113 +343,309 @@ class PredictionModel(nn.Module):
         q_hi = q_hi.squeeze(-1)
         
         return p_t, q_lo, q_hi
+    
+    def loss_fn(self, p_t, sigma_t, y):
+        """
+        Calculate loss for training the model.
+        
+        Args:
+            p_t: Probability predictions (batch_size, 1)
+            sigma_t: Volatility estimates (batch_size, 1)
+            y: Target values (batch_size, 1)
+            
+        Returns:
+            torch.Tensor: Loss value
+        """
+        # Convert p_t from probability to expected return
+        expected_return = (p_t - 0.5) * 2 * 0.02  # Scale to ±2% range
+        
+        # Mean squared error on returns
+        mse_loss = torch.mean((expected_return - y) ** 2)
+        
+        # Volatility calibration loss (encourage sigma_t to match actual squared error)
+        squared_error = (expected_return - y) ** 2
+        vol_loss = torch.mean((sigma_t - squared_error) ** 2)
+        
+        # Combine losses with weighting
+        combined_loss = mse_loss + 0.2 * vol_loss
+        
+        return combined_loss
+
+
+class EnsembleModel:
+    def __init__(self, in_dim, n_models=4, device='cpu'):
+        self.models = []
+        self.device = device
+        
+        # Create models with different architectures and initialization
+        # Model 1: Standard configuration but larger
+        self.models.append(PredictionModel(
+            in_dim=in_dim,
+            hidden_dim=128,  # Increased from default
+            transformer_dim=96,  # Increased from default
+            n_heads=8,  # Increased from 6
+            n_layers=6,  # Increased from 5
+            dropout=0.1
+        ).to(device))
+        
+        # Model 2: Deeper architecture with more regularization
+        self.models.append(PredictionModel(
+            in_dim=in_dim,
+            hidden_dim=144,
+            transformer_dim=102,
+            n_heads=6,
+            n_layers=8,  # More layers
+            dropout=0.2  # More dropout
+        ).to(device))
+        
+        # Model 3: Wider architecture with less regularization
+        self.models.append(PredictionModel(
+            in_dim=in_dim,
+            hidden_dim=160,
+            transformer_dim=120,
+            n_heads=10,
+            n_layers=4,  # Fewer layers but wider
+            dropout=0.05  # Less dropout
+        ).to(device))
+        
+        # Model 4: Hybrid architecture with different activation functions
+        hybrid_model = PredictionModel(
+            in_dim=in_dim,
+            hidden_dim=136,
+            transformer_dim=112,
+            n_heads=7,
+            n_layers=5,
+            dropout=0.15
+        ).to(device)
+        
+        # Modify the hybrid model to use GELU activations
+        for name, module in hybrid_model.named_modules():
+            if isinstance(module, nn.ReLU):
+                if hasattr(nn, 'GELU'):
+                    relu_parent = get_parent_module(hybrid_model, name)
+                    setattr(relu_parent, name.split('.')[-1], nn.GELU())
+        
+        self.models.append(hybrid_model)
+        
+        # Assign different weights to each model - give more weight to larger models
+        self.model_weights = [0.25, 0.25, 0.25, 0.25]
+        
+    def train(self, train_data, optimizer, epochs, scheduler=None):
+        losses = []
+        
+        for epoch in range(epochs):
+            epoch_losses = []
+            
+            for model in self.models:
+                model.train()
+                total_loss = 0
+                
+                for x_batch, y_batch in train_data:
+                    x_batch = x_batch.to(self.device)
+                    y_batch = y_batch.to(self.device)
+                    
+                    optimizer.zero_grad()
+                    
+                    p_t, sigma_t, regime_logits = model(x_batch)
+                    
+                    # Calculate loss
+                    loss = model.loss_fn(p_t, sigma_t, y_batch)
+                    
+                    # Add L2 regularization to prevent overfitting
+                    l2_reg = 0
+                    for param in model.parameters():
+                        l2_reg += torch.norm(param, 2) ** 2
+                    loss += 1e-5 * l2_reg
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                
+                if scheduler:
+                    scheduler.step()
+                
+                avg_loss = total_loss / len(train_data)
+                epoch_losses.append(avg_loss)
+            
+            # Calculate average loss across all models
+            avg_ensemble_loss = sum(epoch_losses) / len(self.models)
+            losses.append(avg_ensemble_loss)
+            
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}: Loss = {avg_ensemble_loss:.6f}")
+        
+        return losses
+        
+    def predict(self, x):
+        # Set all models to evaluation mode
+        for model in self.models:
+            model.eval()
+        
+        p_all = []
+        sigma_all = []
+        regime_all = []
+        
+        with torch.no_grad():
+            for i, model in enumerate(self.models):
+                p_t, sigma_t, regime_logits = model(x)
+                
+                # Apply model weight
+                weight = self.model_weights[i]
+                p_all.append(p_t * weight)
+                sigma_all.append(sigma_t * weight)
+                regime_all.append(regime_logits * weight)
+        
+        # Combine predictions from all models
+        p_ensemble = sum(p_all)
+        sigma_ensemble = sum(sigma_all)
+        regime_ensemble = sum(regime_all)
+        
+        # Calculate prediction uncertainty (variance between models)
+        p_variance = torch.zeros_like(p_ensemble)
+        for p in p_all:
+            p_variance += (p - p_ensemble) ** 2
+        p_variance /= len(self.models)
+        
+        # Adjust sigma based on model disagreement
+        sigma_ensemble = torch.sqrt(sigma_ensemble ** 2 + p_variance)
+        
+        return p_ensemble, sigma_ensemble, regime_ensemble
 
 
 class StrategyLayer(nn.Module):
-    """Strategy layer for DMT v2, transforms predictions into positions."""
+    """Strategy layer for DMT v2, transforms predictions into positions with enhanced risk management."""
     
-    def __init__(self, config, n_regimes=3):
-        """Initialize the strategy layer.
-        
-        Args:
-            config: Configuration instance with strategy parameters
-            n_regimes: Number of market regimes to consider
-        """
+    def __init__(self, config):
         super().__init__()
-        
         self.config = config
         
-        # Learnable long/short thresholds (initialized to proven values)
-        self.theta_L = nn.Parameter(torch.tensor(0.55))  # Standard long threshold
-        self.theta_S = nn.Parameter(torch.tensor(0.45))  # Standard short threshold
-        self.log_k = nn.Parameter(torch.log(torch.tensor(50.0)))
+        # Initialize neural network layers for position sizing
+        self.nz_lin = nn.Linear(3, 1)
         
-        # Adaptive neutral-zone and target vol weights (per regime)
-        self.nz_lin = nn.Linear(n_regimes, 1)
-        self.tau_lin = nn.Linear(n_regimes, 1)
-        self.max_pos_lin = nn.Linear(n_regimes, 1)
+        # Enhanced position sizing networks with larger capacity
+        self.regime_position_net = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Tanh()
+        )
         
-        # Initialize with the high-performing values
-        self.nz_lin.bias.data.fill_(float(config.neutral_zone))
-        self.tau_lin.bias.data.fill_(0.5)  # Middle of sigmoid range
-        self.max_pos_lin.bias.data.fill_(0.5)  # Middle of sigmoid range
+        # Uncertainty handling network
+        self.uncertainty_net = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        )
         
-        # Initialize regime weights according to the original high-performing version
-        # Regime 0: Bull, Regime 1: Neutral, Regime 2: Bear
-        self.nz_lin.weight.data = torch.tensor([[0.01, 0.03, 0.05]])  # Wider neutral zone in bear markets
-        self.tau_lin.weight.data = torch.tensor([[0.2, 0.0, -0.2]])   # Higher target vol in bull markets
-        self.max_pos_lin.weight.data = torch.tensor([[0.3, 0.0, -0.2]])  # Higher max pos in bull markets
-
-    def forward(self, p_t, sigma_t, regime_logits):
-        """Compute position size with adaptive controls.
+        # Volatility adjustment network
+        self.volatility_net = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        )
         
-        Args:
-            p_t: Probability predictions (batch_size,)
-            sigma_t: Volatility estimates (batch_size,)
-            regime_logits: Regime classification logits (batch_size, n_regimes)
+        # Initialize with conservative values
+        with torch.no_grad():
+            # Start with a wider neutral zone
+            self.nz_lin.weight.fill_(0.5)
+            self.nz_lin.bias.fill_(0.5)
+    
+    def forward(self, p_t, sigma_t, regime_logits, equity_curve=None, atr=None, uncertainty=None):
+        # Calculate position size with adaptive controls and risk management
+        regime_probs = F.softmax(regime_logits, dim=1)
+        
+        # Calculate neutral zone - dynamically set based on regime
+        neutral_zone = torch.sigmoid(self.nz_lin(regime_probs)) * self.config.neutral_zone * 2
+        
+        # Base position scaling from prediction
+        raw_pos = torch.zeros_like(p_t)
+        
+        # For values above neutral zone
+        above_mask = p_t > neutral_zone
+        below_mask = p_t < -neutral_zone
+        
+        # More aggressive scaling function with reduced neutral zone
+        raw_pos[above_mask] = ((p_t[above_mask] - neutral_zone[above_mask]) / 
+                              (self.config.tau_max - neutral_zone[above_mask])) * self.config.max_pos
+        
+        raw_pos[below_mask] = ((p_t[below_mask] + neutral_zone[below_mask]) / 
+                              (self.config.tau_max - neutral_zone[below_mask])) * -self.config.max_pos
+        
+        # Apply regime-based position sizing
+        # More aggressive in bullish regimes, more conservative in bearish
+        # Regime weights: [bullish, neutral, bearish]
+        regime_pos_scaling = self.regime_position_net(regime_probs)
+        regime_pos_scaling = 1.0 + 0.5 * torch.tanh(regime_pos_scaling)  # Range: [0.5, 1.5]
+        
+        # Apply uncertainty-based scaling if available
+        uncertainty_scaling = torch.ones_like(p_t)
+        if uncertainty is not None:
+            uncertainty_relative = uncertainty / sigma_t
+            uncertainty_scaling = self.uncertainty_net(uncertainty_relative)
             
-        Returns:
-            position_t: Position sizing (batch_size,)
-        """
-        # Clamp thresholds to reasonable range (0.3-0.7)
-        theta_L = self.theta_L.clamp(0.3, 0.7)
-        theta_S = self.theta_S.clamp(0.3, 0.7)
+            # Scale positions down when uncertainty is high relative to predicted volatility
+            # More aggressive scaling curve - linearly reduce from 1.0 to 0.5 instead of 0.0
+            uncertainty_scaling = 0.5 + 0.5 * (1.0 - torch.clamp(
+                uncertainty_relative / self.config.uncertainty_threshold, 0.0, 1.0))
         
-        # Ensure regime_logits is properly formatted for linear layers
-        if regime_logits.dim() == 1:
-            regime_logits = regime_logits.unsqueeze(0)  # Add batch dimension if missing
-        
-        # Apply softmax to get regime probabilities
-        regime_probs = F.softmax(regime_logits, dim=-1)
-        
-        # Slightly smaller neutral zone (less aggressive than before)
-        nz_t = F.softplus(self.nz_lin(regime_probs).squeeze(-1)) * 0.8
-        
-        # Moderately higher target vol (less aggressive)
-        tau_t = (torch.sigmoid(self.tau_lin(regime_probs)).squeeze(-1) * 0.3 + 0.7) * self.config.tau_max
-        
-        # Dynamic max position based on regime - calculate max position as scalar
-        max_pos_scalar = self.config.max_pos
-        max_pos_modifier = (torch.sigmoid(self.max_pos_lin(regime_probs)).squeeze(-1) * 0.4 + 0.7).mean().item()
-        effective_max_pos = max_pos_scalar * max_pos_modifier
-        
-        # Get steepness factor - slightly increased for sharper transitions
-        k = torch.exp(self.log_k) * 1.1
-        
-        # Compute masks for long and short positions using thresholds directly
-        # Slightly narrower threshold gap for more time in market
-        gap_adjust = 0.015  # Less aggressive threshold adjustment
-        long_mask = (p_t > (theta_L - gap_adjust)).float()
-        short_mask = (p_t < (theta_S + gap_adjust)).float()
-        
-        # Compute signal strengths using clamped thresholds and increased steepness
-        long_sig = torch.sigmoid(k * (p_t - theta_L)) * long_mask
-        short_sig = torch.sigmoid(k * (theta_S - p_t)) * short_mask
-        
-        # Normalize signals
-        norm_sum = long_sig + short_sig + self.config.eps
-        pos_dir = (long_sig / norm_sum) - (short_sig / norm_sum)
-        
-        # Ensure tau_t matches sigma_t's shape
-        if tau_t.shape != sigma_t.shape:
-            if tau_t.dim() == 0 and sigma_t.dim() == 1:
-                # tau_t is scalar, sigma_t is vector
-                tau_t = tau_t.expand_as(sigma_t)
-            elif tau_t.dim() == 1 and sigma_t.dim() == 1 and tau_t.shape[0] != sigma_t.shape[0]:
-                # Both are vectors but with different lengths
-                if tau_t.shape[0] == 1:
-                    tau_t = tau_t.expand_as(sigma_t)
+        # Apply drawdown protection if equity curve is provided
+        drawdown_scaling = torch.ones_like(p_t)
+        if equity_curve is not None and len(equity_curve) > 1:
+            # Calculate current drawdown
+            peak = torch.maximum(equity_curve[0], torch.max(equity_curve))
+            current = equity_curve[-1]
+            drawdown = (current / peak) - 1.0
+            
+            # Apply graduated scaling based on drawdown severity
+            # New: More graduated scaling that reduces position more gently
+            if drawdown < 0:
+                # Convert to positive number for easier comparison
+                drawdown_pct = -drawdown
+                
+                # Define drawdown thresholds and corresponding scaling factors
+                # More granular scale with less aggressive reductions
+                if drawdown_pct < self.config.max_drawdown_threshold * 0.5:
+                    # Minor drawdown - apply minimal scaling
+                    dd_scale = 1.0 - (drawdown_pct / (self.config.max_drawdown_threshold * 2))
+                    drawdown_scaling = torch.ones_like(p_t) * max(dd_scale, 0.9)
+                elif drawdown_pct < self.config.max_drawdown_threshold:
+                    # Moderate drawdown - apply graduated scaling
+                    dd_scale = 0.9 - 0.3 * ((drawdown_pct - self.config.max_drawdown_threshold * 0.5) / 
+                                          (self.config.max_drawdown_threshold * 0.5))
+                    drawdown_scaling = torch.ones_like(p_t) * max(dd_scale, 0.6)
                 else:
-                    # Use the mean of tau_t as a scalar
-                    tau_t = torch.mean(tau_t).expand_as(sigma_t)
+                    # Severe drawdown - apply maximum scaling reduction
+                    drawdown_scaling = torch.ones_like(p_t) * self.config.risk_scaling_factor
         
-        # Apply volatility scaling with scalar max position size
-        dyn_size = (tau_t / (sigma_t + self.config.eps)).clamp(0, effective_max_pos)
+        # Apply volatility-based scaling if ATR is provided
+        volatility_scaling = torch.ones_like(p_t)
+        if atr is not None:
+            # Calculate relative ATR (volatility)
+            relative_atr = atr / equity_curve[-1]
+            
+            # Scale positions based on volatility
+            volatility_scaling = self.volatility_net(relative_atr.unsqueeze(-1))
+            
+            # For low volatility, allow increased position size
+            # For high volatility, reduce position size
+            volatility_scaling = 1.5 - volatility_scaling
         
-        # Apply position scaling
-        position_t = pos_dir * dyn_size
+        # Combine all scaling factors - ensure they work together harmoniously
+        combined_scaling = (regime_pos_scaling * uncertainty_scaling * 
+                           drawdown_scaling * volatility_scaling)
         
-        return position_t
+        # Apply combined scaling to raw position
+        position = raw_pos * combined_scaling
+        
+        # Add position caps to prevent excessive leverage
+        position = torch.clamp(position, -self.config.max_pos, self.config.max_pos)
+        
+        return position
 
 
 class Backtester(nn.Module):
@@ -594,3 +870,19 @@ def create_feature_matrix(prices_df, window_size=20, handle_nans='drop'):
     y = df['target']
     
     return X, y, df
+
+
+# Helper function to get parent module for modifying activations
+def get_parent_module(model, name):
+    """Get the parent module of a nested module specified by name"""
+    if '.' not in name:
+        return model
+    
+    parent_name = '.'.join(name.split('.')[:-1])
+    names = parent_name.split('.')
+    module = model
+    
+    for n in names:
+        module = getattr(module, n)
+    
+    return module

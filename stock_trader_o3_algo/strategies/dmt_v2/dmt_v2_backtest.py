@@ -7,37 +7,42 @@ train the transformer models, and evaluate performance.
 """
 
 import os
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime
-from typing import Tuple, Dict, Optional, List, Union, Any
 
 from .dmt_v2_model import (
     Config, VolatilityEstimator, RegimeClassifier, 
     PredictionModel, StrategyLayer, Backtester, 
-    loss_function, create_feature_matrix
+    loss_function, create_feature_matrix, EnsembleModel
 )
 
 from ..tri_shot.tri_shot_features import fetch_data_from_date
 
 
-def prepare_data(prices: pd.DataFrame, window_size: int = 20) -> Tuple:
+def prepare_data(prices: pd.DataFrame, window_size: int = 20, include_vix: bool = True) -> Tuple:
     """
     Prepare data for the DMT v2 model.
     
     Args:
         prices: DataFrame with price data for QQQ
         window_size: Lookback window for features
+        include_vix: Whether to include VIX data if available
         
     Returns:
         X_tensor: Feature tensors
         y_tensor: Target tensors
         ret_tensor: Return tensors
         dates: Dates for the data points
+        df: Processed DataFrame with all features
+        vix_index: Index of VIX feature in X_tensor, -1 if not available
     """
     # Make a copy to avoid modifying the original DataFrame
     df = prices.copy()
@@ -77,13 +82,14 @@ def prepare_data(prices: pd.DataFrame, window_size: int = 20) -> Tuple:
     df['vol_5d'] = df['returns'].rolling(window=5).std() * np.sqrt(252)
     df['vol_20d'] = df['returns'].rolling(window=20).std() * np.sqrt(252)
     
-    # ATR (14)
+    # ATR (14) - Enhanced calculation for dynamic stop-losses
     tr1 = df['High'] - df['Low']
     tr2 = abs(df['High'] - df['Close'].shift(1))
     tr3 = abs(df['Low'] - df['Close'].shift(1))
     df['true_range'] = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
     df['atr14'] = df['true_range'].rolling(window=14).mean()
     df['tr_pct_close'] = df['true_range'] / df['Close']
+    df['atr_pct'] = df['atr14'] / df['Close']  # ATR as percentage of price
     
     # Mean-reversion / Extremes
     sma20 = df['Close'].rolling(window=20).mean()
@@ -102,17 +108,44 @@ def prepare_data(prices: pd.DataFrame, window_size: int = 20) -> Tuple:
     # Volume Indicators
     df['vol_zscore'] = (df['Volume'] - df['Volume'].rolling(window=20).mean()) / df['Volume'].rolling(window=20).std()
     
+    # Add VIX data if available (from the prices DataFrame if '^VIX' column exists)
+    vix_index = -1  # Default to -1 if VIX not available
+    if include_vix and '^VIX' in df.columns:
+        df['vix'] = df['^VIX']
+        df['vix_zscore'] = (df['vix'] - df['vix'].rolling(window=20).mean()) / df['vix'].rolling(window=20).std()
+        df['vix_ratio'] = df['vix'] / df['vix'].rolling(window=10).mean()
+        df['vix_ma_cross'] = df['vix'] - df['vix'].rolling(window=10).mean()
+    elif include_vix:
+        # Try to fetch VIX data if it wasn't included
+        try:
+            import yfinance as yf
+            vix_data = yf.download('^VIX', start=df.index[0], end=df.index[-1])
+            if not vix_data.empty:
+                vix_data = vix_data.reindex(df.index, method='ffill')
+                df['vix'] = vix_data['Close']
+                df['vix_zscore'] = (df['vix'] - df['vix'].rolling(window=20).mean()) / df['vix'].rolling(window=20).std()
+                df['vix_ratio'] = df['vix'] / df['vix'].rolling(window=10).mean()
+                df['vix_ma_cross'] = df['vix'] - df['vix'].rolling(window=10).mean()
+        except:
+            # If VIX data can't be fetched, continue without it
+            print("Could not fetch VIX data, continuing without it.")
+    
     # Check for NaN values and drop them
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
     
     # Standardize features
     feature_cols = ['returns', 'log_returns', 
-                    'ret_5d', 'ret_10d', 'ret_20d',
-                    'macd', 'macd_signal', 'macd_hist',
-                    'rsi14', 'stoch_k', 'stoch_d',
-                    'vol_5d', 'vol_20d', 'atr14', 'tr_pct_close',
-                    'sma20_dist', 'sma50_dist', 'ema20_dist', 'bb_zscore',
-                    'vol_zscore']
+                   'ret_5d', 'ret_10d', 'ret_20d',
+                   'macd', 'macd_signal', 'macd_hist',
+                   'rsi14', 'stoch_k', 'stoch_d',
+                   'vol_5d', 'vol_20d', 'atr14', 'tr_pct_close', 'atr_pct',
+                   'sma20_dist', 'sma50_dist', 'ema20_dist', 'bb_zscore',
+                   'vol_zscore']
+    
+    # Add VIX features if available
+    if 'vix' in df.columns:
+        feature_cols.extend(['vix', 'vix_zscore', 'vix_ratio', 'vix_ma_cross'])
+        vix_index = len(feature_cols) - 4  # Index of 'vix' in feature_cols
     
     # Create X, y DataFrames
     X = df[feature_cols].copy()
@@ -134,7 +167,7 @@ def prepare_data(prices: pd.DataFrame, window_size: int = 20) -> Tuple:
     y_tensor = torch.tensor(y_np, dtype=torch.float32)
     ret_tensor = torch.tensor(ret_np, dtype=torch.float32)
     
-    return X_tensor, y_tensor, ret_tensor, df.index, df
+    return X_tensor, y_tensor, ret_tensor, df.index, df, vix_index
 
 
 def create_sequence_data(X: torch.Tensor, seq_len: int = 10) -> torch.Tensor:
@@ -231,580 +264,765 @@ def initialize_vol_estimator(returns: torch.Tensor, window_size: int = 20) -> Tu
     return vol_estimator, init_sigma_tensor
 
 
-def run_dmt_v2_backtest(
-    prices: pd.DataFrame,
-    initial_capital: float = 500.0,
-    n_epochs: int = 100,
-    learning_rate: float = 0.015,
-    device: str = 'cpu',
-    seq_len: int = 15,
-    target_annual_vol: float = 0.35,  # Increased from 0.25 to 0.35
-    vol_window: int = 20,
-    max_position_size: float = 2.0,   # Increased from 1.0 to 2.0
-    neutral_zone: float = 0.03,       # Reduced from 0.05 to 0.03
-    plot: bool = True,
-    start_date: Optional[Union[str, pd.Timestamp]] = None,
-    end_date: Optional[Union[str, pd.Timestamp]] = None
-) -> Tuple[pd.DataFrame, Dict]:
+class EnsembleModel(nn.Module):
+    """Ensemble of prediction models for improved robustness."""
+    
+    def __init__(self, feature_dim, n_models=3, hidden_dims=[96, 128, 64], seq_len=15):
+        """Initialize the ensemble model.
+        
+        Args:
+            feature_dim: Input feature dimension
+            n_models: Number of models in the ensemble
+            hidden_dims: List of hidden dimensions for each model
+            seq_len: Sequence length for transformers
+        """
+        super().__init__()
+        
+        self.n_models = n_models
+        self.models = nn.ModuleList()
+        
+        # Create diverse models with different architectures
+        for i in range(n_models):
+            # Vary architecture parameters slightly for diversity
+            n_heads = 4 + i * 2  # 4, 6, 8 heads
+            n_layers = 4 + i * 2  # 4, 6, 8 layers
+            hidden_dim = hidden_dims[i % len(hidden_dims)]
+            dropout = 0.1 + (i * 0.05)  # 0.1, 0.15, 0.2 dropout
+            
+            model = PredictionModel(
+                in_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                out_dim=1,
+                seq_len=seq_len,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                dropout=dropout
+            )
+            self.models.append(model)
+    
+    def forward(self, X_short, X_med, X_long):
+        """Forward pass through the ensemble.
+        
+        Args:
+            X_short: Short-term sequence data
+            X_med: Medium-term sequence data
+            X_long: Long-term sequence data
+            
+        Returns:
+            mean_pred: Mean prediction across models
+            lower_bound: Lower confidence bound (10th percentile)
+            upper_bound: Upper confidence bound (90th percentile)
+            uncertainty: Prediction uncertainty (std dev)
+        """
+        all_preds = []
+        
+        # Get predictions from each model
+        for model in self.models:
+            with torch.no_grad():
+                pred, _, _ = model(X_short, X_med, X_long)
+                all_preds.append(pred)
+        
+        # Stack predictions
+        pred_stack = torch.stack(all_preds, dim=0)
+        
+        # Calculate mean prediction
+        mean_pred = pred_stack.mean(dim=0)
+        
+        # Calculate uncertainty (standard deviation)
+        uncertainty = pred_stack.std(dim=0)
+        
+        # Calculate confidence bounds (10th and 90th percentiles)
+        pred_sorted, _ = torch.sort(pred_stack, dim=0)
+        lower_idx = max(0, int(0.1 * self.n_models) - 1)
+        upper_idx = min(self.n_models - 1, int(0.9 * self.n_models))
+        
+        # Handle edge cases
+        if self.n_models <= 3:
+            lower_bound = pred_sorted[0]
+            upper_bound = pred_sorted[-1]
+        else:
+            lower_bound = pred_sorted[lower_idx]
+            upper_bound = pred_sorted[upper_idx]
+        
+        return mean_pred, lower_bound, upper_bound, uncertainty
+
+
+def train_model(model, train_loader, optimizer, epochs, device, scheduler=None):
     """
-    Run DMT v2 backtest with transformer architecture.
+    Train a PyTorch model with the given data loaders
     
     Args:
-        prices: Price data
-        initial_capital: Starting capital
-        n_epochs: Optimization epochs
-        learning_rate: Learning rate for optimization
-        device: Torch device
-        seq_len: Sequence length for the transformer model
-        target_annual_vol: Target annual volatility for position sizing
-        vol_window: Lookback window for volatility calculation
-        max_position_size: Maximum allowed position size (fraction of capital)
-        neutral_zone: Zone around 0.5 where trades are avoided
-        plot: Whether to plot the results
-        start_date: Start date for backtest (optional)
-        end_date: End date for backtest (optional)
+        model (nn.Module): PyTorch model to train
+        train_loader (DataLoader): Training data loader
+        optimizer (Optimizer): PyTorch optimizer
+        epochs (int): Number of training epochs
+        device (torch.device): Device to train on
+        scheduler (lr_scheduler, optional): Learning rate scheduler
         
     Returns:
-        Results DataFrame and performance metrics
+        list: Training losses
     """
-    # Get device
-    device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
+    losses = []
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        
+        for x_batch, y_batch in train_loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            p_t, sigma_t, regime_logits = model(x_batch)
+            
+            # Calculate loss
+            loss = model.loss_fn(p_t, sigma_t, y_batch)
+            
+            # Add L2 regularization
+            l2_reg = 0
+            for param in model.parameters():
+                l2_reg += torch.norm(param, 2) ** 2
+            loss += 1e-5 * l2_reg
+            
+            # Backward pass and optimize
+            loss.backward()
+            
+            # Clip gradients to avoid explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            if scheduler:
+                scheduler.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        losses.append(avg_loss)
+        
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+    
+    return losses
+
+
+def run_dmt_v2_backtest(data, initial_capital=10000.0, n_epochs=100, target_annual_vol=0.35,
+                      max_position_size=2.0, neutral_zone=0.025, plot=True, use_ensemble=True, 
+                      use_dynamic_stops=True, max_drawdown_threshold=0.2, learning_rate=0.015):
+    """
+    Run a backtest of the DMT v2 strategy with enhanced features.
+    
+    Args:
+        data (pandas.DataFrame): OHLCV data with columns ['Open', 'High', 'Low', 'Close', 'Volume']
+        initial_capital (float): Initial capital for the backtest
+        n_epochs (int): Number of training epochs
+        target_annual_vol (float): Target annualized volatility
+        max_position_size (float): Maximum position size as a multiple of capital
+        neutral_zone (float): Neutral zone size for position calculation
+        plot (bool): Whether to plot the backtest results
+        use_ensemble (bool): Whether to use ensemble modeling
+        use_dynamic_stops (bool): Whether to use dynamic stop-loss levels
+        max_drawdown_threshold (float): Maximum drawdown allowed before reducing exposure
+        learning_rate (float): Learning rate for training
+        
+    Returns:
+        tuple: (results_df, metrics_dict)
+    """
+    # Create a copy of the data to avoid modifying the original
+    data = data.copy()
+    
+    # Check if data is valid and has all required columns
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if not all(col in data.columns for col in required_cols):
+        raise ValueError(f"Data must contain all of {required_cols}")
+    
+    # Save original column case
+    rename_map = {}
+    for col in data.columns:
+        if col.lower() in [c.lower() for c in required_cols]:
+            orig_col = next(c for c in required_cols if c.lower() == col.lower())
+            rename_map[col] = orig_col
+    
+    # Standardize column names if needed
+    if rename_map:
+        data = data.rename(columns=rename_map)
+    
+    # Ensure data is sorted by date
+    data = data.sort_index()
+    
+    # Calculate additional features that will enhance model performance
+    print("Preparing enhanced feature set...")
+    
+    # Price-derived features
+    data['returns'] = data['Close'].pct_change()
+    data['log_returns'] = np.log(data['Close'] / data['Close'].shift(1))
+    
+    # Volatility metrics
+    data['atr'] = calculate_atr(data)
+    data['realized_vol'] = data['returns'].rolling(21).std() * np.sqrt(252)
+    
+    # Momentum indicators
+    for period in [5, 10, 21, 63]:
+        data[f'mom_{period}'] = data['Close'].pct_change(period)
+    
+    # Mean reversion indicators
+    for period in [5, 10, 21]:
+        data[f'mean_rev_{period}'] = (data['Close'] - data['Close'].rolling(period).mean()) / data['Close'].rolling(period).std()
+    
+    # Try to get VIX data or estimate market volatility if unavailable
+    try:
+        start_date = data.index[0] - pd.Timedelta(days=10)
+        end_date = data.index[-1]
+        
+        # If download fails, we'll use a synthetic VIX based on realized volatility
+        vix_data = None
+        
+        # Calculate a synthetic VIX based on rolling volatility
+        data['synthetic_vix'] = data['realized_vol'] * 100
+        
+        # Impute any remaining missing values with forward/backward fill
+        data['synthetic_vix'] = data['synthetic_vix'].fillna(method='ffill').fillna(method='bfill')
+        data['vix_feature'] = data['synthetic_vix']
+        
+        print("Using synthetic VIX derived from realized volatility.")
+    except Exception as e:
+        print(f"Error fetching VIX data: {e}. Using synthetic VIX.")
+        data['vix_feature'] = data['realized_vol'] * 100
+    
+    # Calculate ratios and additional technical indicators to enrich the feature set
+    data['high_low_ratio'] = data['High'] / data['Low']
+    data['close_open_ratio'] = data['Close'] / data['Open']
+    
+    # Gap indicators
+    data['overnight_gap'] = (data['Open'] / data['Close'].shift(1)) - 1
+    
+    # Additional volume indicators
+    data['volume_ma_ratio'] = data['Volume'] / data['Volume'].rolling(10).mean()
+    
+    # Forward returns for train/test target
+    data['target'] = data['returns'].shift(-1)
+    
+    # Drop rows with NaN due to feature calculations
+    data = data.dropna()
+    
+    # Select features for modeling
+    feature_cols = [
+        'returns', 'log_returns', 
+        'atr', 'realized_vol',
+        'mom_5', 'mom_10', 'mom_21', 'mom_63',
+        'mean_rev_5', 'mean_rev_10', 'mean_rev_21',
+        'high_low_ratio', 'close_open_ratio', 'overnight_gap',
+        'volume_ma_ratio', 'vix_feature'
+    ]
+    
+    # Create time-series sequences for the model
+    # We'll use a sequence length of 15 days (3 weeks) to capture patterns
+    seq_len = 15
+    X, y, _ = prepare_sequences(data, feature_cols, seq_len=seq_len)
+    
+    # Split data for training and validation
+    # Use 80% of data for training, 20% for validation
+    split = int(0.8 * len(X))
+    X_train, X_val = X[:split], X[split:]
+    y_train, y_val = y[:split], y[split:]
+    
+    # Create PyTorch datasets and dataloaders
+    batch_size = 64
+    train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+    val_dataset = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    # Set up PyTorch device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Prepare data
-    print("Preparing features and data...")
-    X_tensor, y_tensor, ret_tensor, dates, df = prepare_data(prices, vol_window)
-    
-    # Create multi-timeframe sequence data for transformer
-    print("Creating multi-timeframe sequence data for transformer...")
-    X_short, X_med, X_long = create_multi_timeframe_sequences(X_tensor, short_len=5, med_len=15, long_len=60)
-    
-    # Adjust targets and returns to match sequence data length
-    min_len = min(X_short.size(0), X_med.size(0), X_long.size(0))
-    y_tensor = y_tensor[-min_len:]
-    ret_tensor = ret_tensor[-min_len:]
-    dates = dates[-min_len:]
-    
-    # Move data to device
-    X_short = X_short.to(device)
-    X_med = X_med.to(device)
-    X_long = X_long.to(device)
-    y_tensor = y_tensor.to(device)
-    ret_tensor = ret_tensor.to(device)
-    
-    # Get feature dimension
-    feature_dim = X_tensor.shape[1]
-    n_regimes = 3  # bull, bear, sideways
-    
-    # Initialize model components with parameters from the high-performing version
+    # Configuration for the models
     config = Config(
         eps=1e-8,
-        tau_max=0.35,  # Higher target volatility for more aggressive returns
-        neutral_zone=0.03,  # Smaller neutral zone for more trading opportunities
-        max_pos=2.0,  # Higher max position for more leverage
-        lr=0.01,
-        seq_len=seq_len
-    )
-    
-    # Create model components with proper initialization
-    pred_model = PredictionModel(
-        in_dim=feature_dim,
-        hidden_dim=128,  # Increased hidden dimension for better expressivity
-        out_dim=1,
+        tau_max=target_annual_vol,
+        max_pos=max_position_size,
+        neutral_zone=neutral_zone,
+        lr=learning_rate,
         seq_len=seq_len,
-        n_heads=8,  # More attention heads 
-        n_layers=8   # More transformer layers
-    ).to(device)
-    
-    # Initialize with a slight bias but not too strong
-    for name, param in pred_model.named_parameters():
-        if 'bias' in name:
-            # Initialize bias terms with small random values
-            param.data = torch.randn_like(param.data) * 0.01
-            
-        if 'weight' in name:
-            # Use slightly higher initialization scale
-            param.data = torch.randn_like(param.data) * 0.05
-    
-    # Only apply a very small bias to the final layer to prevent 0.5 predictions
-    for m in pred_model.modules():
-        if isinstance(m, nn.Linear) and m.out_features == 1:
-            m.bias.data = torch.tensor([0.05]).to(device)  # Very small bias
-    
-    # Initialize other components
-    regime_classifier = RegimeClassifier(
-        in_dim=feature_dim,
-        hidden_dim=64, 
-        n_regimes=n_regimes
-    ).to(device)
-    
-    strategy_layer = StrategyLayer(
-        config=config,
-        n_regimes=n_regimes
-    ).to(device)
-    
-    # Learning rate appropriate for convergence with weight decay for regularization
-    optimizer = optim.Adam([
-        {'params': pred_model.parameters(), 'lr': 0.01, 'weight_decay': 1e-4},
-        {'params': regime_classifier.parameters(), 'lr': 0.01, 'weight_decay': 1e-4},
-        {'params': strategy_layer.parameters(), 'lr': 0.01, 'weight_decay': 1e-4}
-    ])
-    
-    # Simple step-based scheduler
-    scheduler = optim.lr_scheduler.StepLR(
-        optimizer, 
-        step_size=20,
-        gamma=0.75
+        max_drawdown_threshold=max_drawdown_threshold,
+        use_ensemble=use_ensemble,
+        use_dynamic_stops=use_dynamic_stops
     )
     
-    # Lists to store training progress
-    losses = []
-    sharpes = []
-    log_returns = []
+    # Create models
+    in_dim = X_train.shape[2]  # Number of features
     
-    # Very short bias correction to avoid all-0.5 predictions
-    print("Light bias correction (3 epochs)...")
-    for epoch in range(3):
-        optimizer.zero_grad()
-        
-        # Forward pass - note updated to use multi-timeframe inputs
-        p_t, _, _ = pred_model(X_short, X_med, X_long)
-        
-        # Minimal bias loss - just enough to avoid 0.5 predictions
-        bias_loss = ((p_t.mean() - 0.51) ** 2) * 5
-        
-        # Backward pass and optimize
-        bias_loss.backward()
-        optimizer.step()
-        
-        avg_pred = p_t.mean().item()
-        print(f"Bias correction epoch {epoch+1}/3, Mean prediction: {avg_pred:.4f}")
-    
-    print("Main training loop...")
-    
-    # Training loop parameters
-    best_loss = float('inf')
-    patience = 15
-    patience_counter = 0
-    
-    T = X_short.shape[0]
-    sigma_est = torch.ones(T, device=device) * target_annual_vol
-    
-    for epoch in range(1, n_epochs + 1):
-        optimizer.zero_grad()
-        
-        print(f"Debug - Preparing tensors for training:")
-        print(f"X_short shape: {X_short.shape}")
-        print(f"X_med shape: {X_med.shape}")
-        print(f"X_long shape: {X_long.shape}")
-        print(f"ret_tensor shape: {ret_tensor.shape}")
-        
-        # Forward pass with multi-timeframe inputs
-        p_t, q_lo, q_hi = pred_model(X_short, X_med, X_long)
-        
-        # Get final timestep features from short-term sequence for regime classifier
-        final_inputs = X_short[:, -1, :]
-        regime_logits = regime_classifier(final_inputs)
-        
-        # Debug tensor shapes
-        print(f"Debug - Generated predictions:")
-        print(f"p_t shape: {p_t.shape}")
-        print(f"final_inputs shape: {final_inputs.shape}")
-        print(f"regime_logits shape: {regime_logits.shape}")
-        print(f"sigma_est shape: {sigma_est.shape}")
-        
-        # Reshape to ensure consistent dimensions
-        print(f"Debug - After reshaping:")
-        print(f"p_t shape: {p_t.shape}")
-        print(f"regime_logits shape: {regime_logits.shape}")
-        print(f"sigma_est shape: {sigma_est.shape}")
-        
-        # Forward through strategy layer to get positions
-        pos_t = strategy_layer(p_t, sigma_est, regime_logits)
-        
-        # Debug tensor shapes
-        print(f"Debug - Before returns calculation:")
-        print(f"pos_t shape: {pos_t.shape}")
-        print(f"ret_tensor shape: {ret_tensor.shape}")
-        
-        # Calculate PnL and loss
-        if pos_t.shape[0] > ret_tensor.shape[0]:
-            # If pos_t has extra elements, trim it
-            pos_t = pos_t[-ret_tensor.shape[0]:]
-        elif pos_t.shape[0] < ret_tensor.shape[0]:
-            # If ret_tensor has extra elements, trim it
-            ret_tensor = ret_tensor[-pos_t.shape[0]:]
-        
-        # Debug tensor shapes
-        print(f"Debug - After alignment:")
-        print(f"aligned_pos shape: {pos_t.shape}")
-        print(f"aligned_ret shape: {ret_tensor.shape}")
-        
-        # Calculate PnL
-        pnl = pos_t * ret_tensor
-        
-        # Cumulative log returns (log of equity curve)
-        log_eq = torch.cumsum(torch.log1p(pnl), dim=0)
-        
-        # If log_eq has NaN values, replace with zeros
-        log_eq = torch.nan_to_num(log_eq, nan=0.0)
-        
-        # Calculate Sharpe ratio
-        if log_eq[-1].item() > 0:
-            returns = pnl
-            sharpe = log_eq[-1] / (torch.std(returns) * torch.sqrt(torch.tensor(252.0)))
-        else:
-            sharpe = torch.tensor(-1.0, device=device)
-        
-        # L2 regularization for regime classifier
-        l2_reg = torch.tensor(0.0, device=device)
-        for param in regime_classifier.parameters():
-            l2_reg += torch.norm(param, p=2)
-        
-        # Final loss function
-        loss = -sharpe + 0.01 * l2_reg
-        
-        # Backprop and optimize
-        loss.backward()
-        
-        # Clip gradients to stabilize training
-        torch.nn.utils.clip_grad_norm_(pred_model.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(regime_classifier.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(strategy_layer.parameters(), 1.0)
-        
-        optimizer.step()
-        
-        # Update learning rate
-        scheduler.step()
-        
-        # Print progress
-        if epoch == 1 or epoch % 10 == 0 or epoch == n_epochs:
-            print(f"Epoch {epoch}/{n_epochs}, Loss: {loss.item():.4f}, Sharpe: {-loss.item():.2f}, LogReturn: {log_eq[-1].item():.4f}")
-            print(f"  Parameters - Long: {strategy_layer.theta_L.item():.3f}, Short: {strategy_layer.theta_S.item():.3f}")
-            
-            # Print prediction statistics for debugging
-            print(f"    Predictions (p_t) - Min: {p_t.min().item():.3f}, Max: {p_t.max().item():.3f}, Mean: {p_t.mean().item():.3f}")
-            print(f"    Regime logits - Mean: {regime_logits.mean(dim=0)}")
-        
-        # Early stopping check
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-        
-        # Record metrics
-        losses.append(loss.item())
-        
-        # Calculate Sharpe for monitoring
-        sharpe = -loss.item()  # Since loss is -Sharpe
-        sharpes.append(sharpe)
-        
-        # Calculate log return for monitoring
-        log_ret = log_eq[-1].item()
-        log_returns.append(log_ret)
-    
-    # Final forward pass for evaluation
-    print("\nRunning final evaluation with optimized DMT v2 parameters...")
-    
-    # Forward pass through all networks for final evaluation
-    p_t, _, _ = pred_model(X_short, X_med, X_long)
-    
-    # Get regime predictions
-    final_inputs = X_short[:, -1, :]
-    regime_logits = regime_classifier(final_inputs)
-    
-    # Use constant volatility for simplicity in evaluation
-    sigma_t = torch.ones_like(p_t) * target_annual_vol
-    
-    # Ensure position calculations are appropriate
-    # We'll use more aggressive parameters for the evaluation to ensure we get real positions
-    with torch.no_grad():
-        # Modify thresholds for evaluation to ensure non-zero positions
-        strategy_layer.theta_L.data = torch.tensor(0.45).to(device)  # Lower threshold for long entries
-        strategy_layer.theta_S.data = torch.tensor(0.55).to(device)  # Higher threshold for short entries
-        
-        # Override regime weights for more aggressive positioning
-        strategy_layer.nz_lin.bias.data.fill_(0.02)  # Smaller neutral zone
-        strategy_layer.tau_lin.bias.data.fill_(0.7)  # Higher vol target scaling
-        strategy_layer.max_pos_lin.bias.data.fill_(0.8)  # Higher position sizing
-        
-        # Forward pass through strategy layer with modified parameters
-        pos_t = strategy_layer(p_t, sigma_t, regime_logits)
-    
-    # Convert to numpy arrays
-    positions = pos_t.detach().cpu().numpy()
-    dates_np = dates[-len(positions):]  # Adjust dates to match positions length
-    returns_np = ret_tensor.cpu().numpy()[-len(positions):]  # Adjust returns to match positions length
-    
-    # Check position statistics before proceeding
-    pos_min, pos_max, pos_mean = positions.min(), positions.max(), positions.mean()
-    print(f"Position statistics - Min: {pos_min:.4f}, Max: {pos_max:.4f}, Mean: {pos_mean:.4f}")
-    
-    # If positions are still too small, generate more dynamic positions based on market conditions
-    if abs(pos_mean) < 0.1 or abs(pos_max - pos_min) < 0.1:
-        print("Positions still too small. Using MACD-based strategy instead.")
-        
-        # Get price data
-        prices_arr = df['Close'].values if 'Close' in df.columns else None
-        
-        if prices_arr is not None and len(prices_arr) > 30:
-            # Calculate MACD components
-            # Fast EMA (12 periods)
-            ema12 = np.zeros_like(prices_arr)
-            # Slow EMA (26 periods)
-            ema26 = np.zeros_like(prices_arr)
-            # MACD line
-            macd = np.zeros_like(prices_arr)
-            # Signal line (9-period EMA of MACD)
-            signal = np.zeros_like(prices_arr)
-            
-            # Calculate EMAs and MACD
-            alpha_12 = 2 / (12 + 1)
-            alpha_26 = 2 / (26 + 1)
-            alpha_9 = 2 / (9 + 1)
-            
-            # First values are simple averages
-            if len(prices_arr) >= 12:
-                ema12[11] = np.mean(prices_arr[:12])
-            if len(prices_arr) >= 26:
-                ema26[25] = np.mean(prices_arr[:26])
-            
-            # Calculate subsequent EMA values
-            for i in range(len(prices_arr)):
-                if i > 11:
-                    ema12[i] = prices_arr[i] * alpha_12 + ema12[i-1] * (1 - alpha_12)
-                if i > 25:
-                    ema26[i] = prices_arr[i] * alpha_26 + ema26[i-1] * (1 - alpha_26)
-                if i > 25:
-                    macd[i] = ema12[i] - ema26[i]
-            
-            # Calculate signal line (9-period EMA of MACD)
-            if len(prices_arr) >= 35:  # 26 + 9
-                signal[34] = np.mean(macd[26:35])
-                for i in range(35, len(prices_arr)):
-                    signal[i] = macd[i] * alpha_9 + signal[i-1] * (1 - alpha_9)
-            
-            # Histogram (MACD - Signal)
-            histogram = macd - signal
-            
-            # Generate positions based on MACD signals
-            positions = np.zeros(len(p_t.detach().cpu().numpy()))
-            
-            for i in range(len(positions)):
-                idx = min(i, len(histogram) - 1)  # Ensure index is in bounds
-                if idx >= 35:  # Need at least 35 days for valid MACD signal
-                    # MACD crossing above signal line (bullish)
-                    if macd[idx] > signal[idx] and macd[idx-1] <= signal[idx-1]:
-                        positions[i] = 1.0
-                    # MACD crossing below signal line (bearish)
-                    elif macd[idx] < signal[idx] and macd[idx-1] >= signal[idx-1]:
-                        positions[i] = -1.0
-                    # MACD positive and above signal (bullish continuation)
-                    elif macd[idx] > 0 and macd[idx] > signal[idx]:
-                        positions[i] = 0.5
-                    # MACD negative and below signal (bearish continuation)
-                    elif macd[idx] < 0 and macd[idx] < signal[idx]:
-                        positions[i] = -0.5
-                    # Use histogram direction for fine-tuning
-                    elif histogram[idx] > histogram[idx-1]:
-                        positions[i] = 0.2  # Slight bullish bias
-                    else:
-                        positions[i] = -0.2  # Slight bearish bias
-            
-            # Apply volatility scaling
-            vol = np.std(returns_np) * np.sqrt(252) if len(returns_np) > 5 else 0.15
-            vol = max(vol, 0.05)  # Ensure minimum volatility
-            vol_scale = target_annual_vol / vol
-            positions *= vol_scale
-            
-            # Apply dynamic position sizing based on MACD strength
-            for i in range(len(positions)):
-                idx = min(i, len(histogram) - 1)
-                if idx >= 35:
-                    # Scale by normalized histogram strength for more conviction
-                    hist_strength = min(max(abs(histogram[idx]) / np.std(histogram[35:]), 0.5), 2.0)
-                    positions[i] *= hist_strength
-            
-            # Limit max position size
-            positions = np.clip(positions, -max_position_size, max_position_size)
-        else:
-            # If not enough price data, use exponential decay curve strategy
-            # This is a more sophisticated alternating strategy that creates smoother transitions
-            positions = np.zeros(len(p_t.detach().cpu().numpy()))
-            for i in range(len(positions)):
-                # Create a smoother cycle with exponential curves
-                cycle_pos = np.sin(i / 5 * np.pi)  # Smoother cycle
-                if cycle_pos > 0:
-                    positions[i] = np.exp(cycle_pos) - 1  # Long positions with exp growth
-                else:
-                    positions[i] = -1 * (np.exp(-cycle_pos) - 1)  # Short positions with exp growth
-            
-            # Scale positions
-            positions *= max_position_size * 0.7
-        
-        # Ensure no NaN values
-        positions = np.nan_to_num(positions, nan=0.0)
-        
-        # Final check to ensure we have non-zero positions
-        if np.all(np.abs(positions) < 0.1):
-            print("Warning: Positions still too small. Using Buy & Hold strategy instead.")
-            # Just use a simple Buy & Hold strategy
-            positions = np.ones(len(positions)) * max_position_size * 0.5
-        
-        pos_min, pos_max, pos_mean = positions.min(), positions.max(), positions.mean()
-        print(f"New position statistics - Min: {pos_min:.4f}, Max: {pos_max:.4f}, Mean: {pos_mean:.4f}")
-    
-    # Make sure we have exactly matching lengths for positions and returns
-    min_len = min(len(positions), len(returns_np), len(dates_np))
-    positions = positions[:min_len]
-    returns_np = returns_np[:min_len]
-    dates_np = dates_np[:min_len]
-    
-    print(f"Checking array lengths - positions: {len(positions)}, returns: {len(returns_np)}, index: {len(dates_np)}")
-    
-    # Examine position values to ensure they're not all zeros
-    print(f"Position statistics - Min: {positions.min():.4f}, Max: {positions.max():.4f}, Mean: {positions.mean():.4f}")
-    
-    # Create a DataFrame for displaying results
-    results_df = pd.DataFrame(index=dates_np)
-    results_df['returns'] = returns_np
-    results_df['positions'] = positions
-    
-    # Check for any NaN values and replace them
-    results_df = results_df.replace([np.inf, -np.inf], np.nan)
-    results_df = results_df.fillna(0)
-    
-    # Calculate strategy returns
-    results_df['strategy_returns'] = results_df['positions'] * results_df['returns']
-    
-    # Calculate strategy equity curve, starting with initial_capital
-    results_df['strategy_equity'] = initial_capital * (1 + results_df['strategy_returns']).cumprod()
-    results_df['buy_hold_equity'] = initial_capital * (1 + results_df['returns']).cumprod()
-    
-    # Ensure no NaN values in equity curves
-    if results_df['strategy_equity'].isnull().any():
-        print("WARNING: Found NaN values in strategy equity curve. Filling with forward fill method.")
-        results_df['strategy_equity'] = results_df['strategy_equity'].ffill()
-    
-    if results_df['strategy_equity'].isnull().any():
-        # If still NaN after forward fill, fill with initial capital
-        results_df['strategy_equity'] = results_df['strategy_equity'].fillna(initial_capital)
-    
-    if results_df['buy_hold_equity'].isnull().any():
-        # Do the same for buy & hold
-        results_df['buy_hold_equity'] = results_df['buy_hold_equity'].ffill().fillna(initial_capital)
-    
-    # Calculate drawdown
-    results_df['strategy_peak'] = results_df['strategy_equity'].cummax()
-    results_df['strategy_drawdown'] = (results_df['strategy_equity'] / results_df['strategy_peak'] - 1)
-    
-    # Calculate trading statistics
-    total_days = len(results_df)
-    if total_days > 0:
-        # Make sure we have valid equity values
-        final_equity = results_df['strategy_equity'].iloc[-1]
-        if np.isnan(final_equity) or final_equity <= 0:
-            final_equity = initial_capital  # Fallback if invalid
-        
-        total_return = final_equity / initial_capital - 1
-        
-        # Calculate CAGR
-        years = total_days / 252
-        years = max(years, 0.1)  # Avoid division by zero
-        cagr = (final_equity / initial_capital) ** (1 / years) - 1
-        
-        # Calculate volatility
-        volatility = results_df['strategy_returns'].std() * np.sqrt(252)
-        sharpe_ratio = (cagr - 0.02) / volatility if volatility > 0 else 0
-        max_drawdown = results_df['strategy_drawdown'].min()
-        
-        # Calculate baseline statistics
-        final_bh_equity = results_df['buy_hold_equity'].iloc[-1]
-        bh_total_return = final_bh_equity / initial_capital - 1
-        bh_cagr = (final_bh_equity / initial_capital) ** (1 / years) - 1
-        bh_volatility = results_df['returns'].std() * np.sqrt(252)
-        bh_sharpe = (bh_cagr - 0.02) / bh_volatility if bh_volatility > 0 else 0
-        bh_peak = results_df['buy_hold_equity'].cummax()
-        bh_drawdown = (results_df['buy_hold_equity'] / bh_peak - 1)
-        bh_max_dd = bh_drawdown.min()
+    if use_ensemble:
+        print("Using enhanced ensemble of models...")
+        model = EnsembleModel(in_dim=in_dim, device=device)
     else:
-        # Default values if no trading days
-        final_equity = initial_capital
-        total_return = 0
-        cagr = 0
-        volatility = 0
-        sharpe_ratio = 0
-        max_drawdown = 0
-        final_bh_equity = initial_capital
-        bh_total_return = 0
-        bh_cagr = 0
-        bh_volatility = 0
-        bh_sharpe = 0
-        bh_max_dd = 0
+        print("Using single model...")
+        model = PredictionModel(
+            in_dim=in_dim,
+            hidden_dim=128,
+            transformer_dim=96,
+            n_heads=8,
+            n_layers=6,
+            dropout=0.1
+        ).to(device)
     
-    # Collect performance metrics
-    metrics = {
-        'initial_value': initial_capital,
-        'final_value': final_equity,
-        'total_return': total_return,
-        'cagr': cagr,
-        'volatility': volatility,
-        'sharpe_ratio': sharpe_ratio,
-        'max_drawdown': max_drawdown,
-        'buy_hold_return': bh_total_return,
-        'buy_hold_cagr': bh_cagr,
-        'buy_hold_sharpe': bh_sharpe,
-        'buy_hold_max_dd': bh_max_dd
-    }
+    # Create optimizer with weight decay for regularization
+    if use_ensemble:
+        # Create a parameter list from all models
+        all_params = []
+        for m in model.models:
+            all_params.extend(list(m.parameters()))
+        optimizer = torch.optim.AdamW(all_params, lr=config.lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     
-    # Print performance comparison
-    print("\n=== Performance Comparison ===")
-    print(f"DMT v2 Strategy (Optimized):")
-    print(f"  Final Value:    ${metrics['final_value']:.2f}")
-    print(f"  Total Return:   {metrics['total_return']*100:.2f}%")
-    print(f"  Annualized:     {metrics['cagr']*100:.2f}%")
-    print(f"  Volatility:     {metrics['volatility']*100:.2f}%")
-    print(f"  Sharpe Ratio:   {metrics['sharpe_ratio']:.2f}")
-    print(f"  Max Drawdown:   {metrics['max_drawdown']*100:.2f}%")
-    print()
-    print(f"Baseline Strategy (Fixed Size):")
-    print(f"  Final Value:    ${results_df['buy_hold_equity'].iloc[-1]:.2f}")
-    print(f"  Total Return:   {metrics['buy_hold_return']*100:.2f}%")
-    print(f"  Annualized:     {metrics['buy_hold_cagr']*100:.2f}%")
-    print(f"  Volatility:     {bh_volatility*100:.2f}%")
-    print(f"  Sharpe Ratio:   {metrics['buy_hold_sharpe']:.2f}")
-    print(f"  Max Drawdown:   {metrics['buy_hold_max_dd']*100:.2f}%")
-    print()
-    print(f"Optimized Parameters:")
-    print(f"  Long Threshold: {strategy_layer.theta_L.item():.3f}")
-    print(f"  Short Threshold: {strategy_layer.theta_S.item():.3f}")
+    # Learning rate scheduler for better convergence
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=config.lr,
+        steps_per_epoch=len(train_loader),
+        epochs=n_epochs
+    )
     
-    # Plot results if requested
+    # Train models
+    print(f"Training model for {n_epochs} epochs...")
+    if use_ensemble:
+        losses = model.train(train_loader, optimizer, n_epochs, scheduler)
+    else:
+        losses = train_model(model, train_loader, optimizer, n_epochs, device, scheduler)
+    
+    # Run backtest
+    print("Running backtest...")
+    results_df, metrics = backtest_strategy(
+        data.iloc[seq_len:],  # Skip the first seq_len rows used for sequences
+        model,
+        feature_cols,
+        seq_len,
+        initial_capital,
+        config,
+        device
+    )
+    
+    # Add baseline equity columns (buy and hold)
+    initial_price = data['Close'].iloc[seq_len]
+    final_price = data['Close'].iloc[-1]
+    daily_returns = data['Close'].pct_change()
+    
+    # Calculate buy and hold performance
+    buy_hold_equity = []
+    baseline_capital = initial_capital
+    
+    for i in range(len(results_df)):
+        idx = results_df.index[i]
+        if i > 0:
+            # Update based on daily return
+            r = data.loc[idx, 'returns']
+            baseline_capital *= (1 + r)
+        buy_hold_equity.append(baseline_capital)
+    
+    results_df['baseline_equity'] = buy_hold_equity
+    results_df['buy_hold_equity'] = buy_hold_equity
+    
+    # Print performance metrics
+    print("\nPerformance Metrics:")
+    print(f"Total Return: {metrics['total_return']:.2%}")
+    print(f"Annualized Return: {metrics['cagr']:.2%}")
+    print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+    print(f"Sortino Ratio: {metrics['sortino_ratio']:.2f}")
+    print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
+    print(f"Win Rate: {metrics['win_rate']:.2%}")
+    print(f"Avg Profit/Loss Ratio: {metrics['avg_profit_loss_ratio']:.2f}")
+    
+    # Regime analysis
+    if 'regime_probs' in metrics:
+        print("\nAverage Regime Probabilities:")
+        for i, prob in enumerate(metrics['regime_probs']):
+            regime_name = ['Bull', 'Neutral', 'Bear'][i]
+            print(f"{regime_name} Market: {prob:.2%}")
+    
+    # Generate plot
     if plot:
-        plt.figure(figsize=(14, 7))
-        plt.subplot(2, 1, 1)
-        plt.plot(results_df.index, results_df['strategy_equity'], label='DMT v2 Strategy')
-        plt.plot(results_df.index, results_df['buy_hold_equity'], label='Buy & Hold', alpha=0.7)
-        plt.ylabel('Account Value ($)')
-        plt.legend()
-        plt.title('DMT v2 Strategy Performance')
-        plt.grid(True)
-        
-        plt.subplot(2, 1, 2)
-        plt.plot(results_df.index, results_df['positions'], label='Position Size')
-        plt.plot(results_df.index, results_df['strategy_drawdown'], label='Drawdown', alpha=0.7, color='red')
-        plt.axhline(y=0, color='k', linestyle='-', alpha=0.2)
-        plt.ylabel('Position Size / Drawdown')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('dmt_v2_performance.png')
+        plot_backtest_results(results_df, metrics)
     
-    print(f"DMT_v2 backtest completed: Final value ${metrics['final_value']:.2f}, Total Return: {metrics['total_return']*100:.2f}%")
+    # Save results to CSV
+    os.makedirs('tri_shot_data', exist_ok=True)
+    results_file = os.path.join('tri_shot_data', 'dmt_v2_backtest_results.csv')
+    results_df.to_csv(results_file)
+    print(f"Results saved to {results_file}")
     
     return results_df, metrics
+
+def prepare_sequences(data, feature_cols, seq_len=15, target_col='target'):
+    """
+    Create sequence data for time-series modeling
+    
+    Args:
+        data (pandas.DataFrame): DataFrame with features and target
+        feature_cols (list): Feature column names
+        seq_len (int): Sequence length
+        target_col (str): Target column name
+        
+    Returns:
+        tuple: (X, y, df) - sequences, targets, and original data
+    """
+    # Extract features and target
+    features = data[feature_cols].values
+    target = data[target_col].values
+    
+    # Create sequences
+    X = []
+    y = []
+    
+    # For each possible sequence of length seq_len
+    for i in range(len(data) - seq_len):
+        # Get sequence of features
+        seq = features[i:i+seq_len]
+        # Get target (next day's return)
+        target_val = target[i+seq_len-1]
+        
+        X.append(seq)
+        y.append(target_val)
+    
+    # Convert to numpy arrays
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32).reshape(-1, 1)
+    
+    return X, y, data.iloc[seq_len-1:-1]
+
+def calculate_atr(data, period=14):
+    """Calculate Average True Range (ATR)"""
+    high = data['High']
+    low = data['Low']
+    close = data['Close'].shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - close)
+    tr3 = abs(low - close)
+    
+    tr = pd.DataFrame({"tr1": tr1, "tr2": tr2, "tr3": tr3}).max(axis=1)
+    atr = tr.rolling(period).mean()
+    
+    return atr
+
+def backtest_strategy(data, model, feature_cols, seq_len, initial_capital, config, device):
+    """
+    Backtest the DMT v2 strategy on historical data
+    
+    Args:
+        data (pandas.DataFrame): OHLCV data with features
+        model: Prediction model (single or ensemble)
+        feature_cols (list): Feature column names
+        seq_len (int): Sequence length for model input
+        initial_capital (float): Initial capital
+        config (Config): Strategy configuration
+        device (torch.device): PyTorch device
+        
+    Returns:
+        tuple: (results_df, metrics_dict)
+    """
+    # Initialize results
+    dates = data.index
+    equity_curve = [initial_capital]
+    positions = [0.0]
+    daily_returns = [0.0]
+    trades = []
+    current_position = 0.0
+    
+    # Initialize regime tracking
+    regime_counts = np.zeros(3)  # [bull, neutral, bear]
+    
+    # Set model to evaluation mode
+    if hasattr(model, 'models'):  # Ensemble model
+        for m in model.models:
+            m.eval()
+    else:
+        model.eval()
+    
+    # Track stop-loss levels
+    stop_loss = None
+    
+    # Loop through data day by day
+    for i in range(seq_len, len(data)):
+        current_date = dates[i]
+        prev_date = dates[i-1]
+        
+        # Get feature sequence up to current day (excluding current day's return)
+        feature_sequence = data[feature_cols].iloc[i-seq_len:i].values
+        
+        # Convert to PyTorch tensor
+        x = torch.from_numpy(feature_sequence).float().unsqueeze(0).to(device)
+        
+        # Get model predictions
+        with torch.no_grad():
+            if hasattr(model, 'predict'):  # Ensemble model
+                p_t, sigma_t, regime_logits = model.predict(x)
+            else:
+                p_t, sigma_t, regime_logits = model(x)
+        
+        # Get regime probabilities
+        regime_probs = F.softmax(regime_logits, dim=1).squeeze().cpu().numpy()
+        regime_counts += regime_probs
+        
+        # Extract ATR for stop-loss calculation
+        current_atr = data['atr'].iloc[i]
+        
+        # Create equity tensor for drawdown calculation
+        equity_tensor = torch.tensor([equity_curve], dtype=torch.float32).to(device)
+        
+        # Extract uncertainty (for ensemble)
+        uncertainty = None
+        if hasattr(model, 'predict') and config.use_ensemble:
+            # Use the variance between model predictions as uncertainty
+            all_preds = []
+            for m in model.models:
+                with torch.no_grad():
+                    pred, _, _ = m(x)
+                    all_preds.append(pred.item())
+            
+            # Calculate standard deviation of predictions
+            if len(all_preds) > 1:
+                uncertainty = torch.tensor([[np.std(all_preds)]], dtype=torch.float32).to(device)
+        
+        # Create strategy layer if not using an internal one
+        if not hasattr(model, 'strategy'):
+            strategy = StrategyLayer(config).to(device)
+        
+        # Calculate new position
+        if hasattr(model, 'strategy'):
+            # Use model's internal strategy layer
+            new_position = model.strategy(
+                p_t, sigma_t, regime_logits, 
+                equity_curve=equity_tensor,
+                atr=torch.tensor([[current_atr]], dtype=torch.float32).to(device),
+                uncertainty=uncertainty
+            ).item()
+        else:
+            # Use our strategy layer
+            new_position = strategy(
+                p_t, sigma_t, regime_logits, 
+                equity_curve=equity_tensor,
+                atr=torch.tensor([[current_atr]], dtype=torch.float32).to(device),
+                uncertainty=uncertainty
+            ).item()
+        
+        # Apply dynamic stop-loss if enabled
+        if config.use_dynamic_stops:
+            current_price = data['Close'].iloc[i]
+            
+            # Set stop-loss when entering a position
+            if abs(new_position) > 0.1 and abs(current_position) < 0.1:
+                if new_position > 0:  # Long position
+                    stop_loss = current_price - (current_atr * config.stop_loss_atr_multiple)
+                else:  # Short position
+                    stop_loss = current_price + (current_atr * config.stop_loss_atr_multiple)
+            
+            # Check if stop-loss has been hit
+            elif stop_loss is not None:
+                if (new_position > 0 and data['Low'].iloc[i] <= stop_loss) or \
+                   (new_position < 0 and data['High'].iloc[i] >= stop_loss):
+                    # Stop-loss hit - close position
+                    new_position = 0
+                    trades.append({
+                        'exit_date': current_date,
+                        'reason': 'stop_loss',
+                        'price': stop_loss
+                    })
+                    stop_loss = None
+            
+            # Reset stop-loss if position closed or flipped
+            if abs(new_position) < 0.1 or (new_position * current_position < 0):
+                stop_loss = None
+        
+        # Record when a trade is opened or closed
+        if abs(new_position - current_position) > 0.1:
+            if abs(current_position) < 0.1 and abs(new_position) > 0.1:
+                # Opening a new position
+                trades.append({
+                    'entry_date': current_date,
+                    'direction': 'long' if new_position > 0 else 'short',
+                    'size': abs(new_position),
+                    'price': data['Close'].iloc[i]
+                })
+            elif abs(current_position) > 0.1 and abs(new_position) < 0.1:
+                # Closing a position
+                trades.append({
+                    'exit_date': current_date,
+                    'reason': 'signal',
+                    'price': data['Close'].iloc[i]
+                })
+        
+        # Calculate daily return based on position
+        daily_return = current_position * data['returns'].iloc[i]
+        
+        # Update equity
+        new_equity = equity_curve[-1] * (1 + daily_return)
+        
+        # Record results
+        equity_curve.append(new_equity)
+        positions.append(new_position)
+        daily_returns.append(daily_return)
+        
+        # Update position for next day
+        current_position = new_position
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame({
+        'dmt_v2_equity': equity_curve[1:],  # Skip initial equity
+        'position': positions[1:],          # Skip initial position
+        'daily_return': daily_returns[1:]   # Skip initial return
+    }, index=dates[seq_len:])
+    
+    # Calculate performance metrics
+    metrics = calculate_performance_metrics(results_df, initial_capital)
+    
+    # Add regime probabilities
+    if len(regime_counts) > 0:
+        metrics['regime_probs'] = regime_counts / len(data[seq_len:])
+    
+    # Add trade statistics
+    if trades:
+        metrics['trades'] = trades
+        metrics['trade_count'] = len([t for t in trades if 'entry_date' in t])
+    
+    return results_df, metrics
+
+def calculate_performance_metrics(results_df, initial_capital):
+    """
+    Calculate performance metrics from backtest results
+    
+    Args:
+        results_df (pandas.DataFrame): Backtest results
+        initial_capital (float): Initial capital
+        
+    Returns:
+        dict: Performance metrics
+    """
+    equity = results_df['dmt_v2_equity'].values
+    daily_returns = results_df['daily_return'].values
+    
+    # Calculate returns
+    total_return = (equity[-1] / initial_capital) - 1
+    
+    # Calculate days and annualized return
+    days = len(results_df)
+    years = days / 252  # Assuming 252 trading days per year
+    cagr = (equity[-1] / initial_capital) ** (1 / years) - 1
+    
+    # Calculate drawdown
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity / peak - 1
+    max_drawdown = np.min(drawdown)
+    
+    # Calculate Sharpe ratio (assuming risk-free rate of 2%)
+    risk_free_daily = 0.02 / 252
+    excess_returns = daily_returns - risk_free_daily
+    sharpe_ratio = (np.mean(excess_returns) / np.std(daily_returns)) * np.sqrt(252)
+    
+    # Calculate Sortino ratio (downside risk only)
+    downside_returns = np.where(daily_returns < 0, daily_returns, 0)
+    sortino_ratio = (np.mean(excess_returns) / np.std(downside_returns)) * np.sqrt(252) if len(downside_returns) > 0 else 0
+    
+    # Calculate win rate and profit/loss ratio
+    wins = np.sum(daily_returns > 0)
+    losses = np.sum(daily_returns < 0)
+    win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
+    
+    avg_win = np.mean(daily_returns[daily_returns > 0]) if np.any(daily_returns > 0) else 0
+    avg_loss = abs(np.mean(daily_returns[daily_returns < 0])) if np.any(daily_returns < 0) else 1
+    avg_profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+    
+    # Calculate maximum consecutive wins/losses
+    win_streak = 0
+    loss_streak = 0
+    max_win_streak = 0
+    max_loss_streak = 0
+    current_streak = 0
+    
+    for ret in daily_returns:
+        if ret > 0:
+            if current_streak > 0:
+                current_streak += 1
+            else:
+                current_streak = 1
+            max_win_streak = max(max_win_streak, current_streak)
+        elif ret < 0:
+            if current_streak < 0:
+                current_streak -= 1
+            else:
+                current_streak = -1
+            max_loss_streak = min(max_loss_streak, current_streak)
+        else:
+            current_streak = 0
+    
+    max_win_streak = max_win_streak
+    max_loss_streak = abs(max_loss_streak)
+    
+    return {
+        'initial_capital': initial_capital,
+        'final_equity': equity[-1],
+        'total_return': total_return,
+        'cagr': cagr,
+        'sharpe_ratio': sharpe_ratio,
+        'sortino_ratio': sortino_ratio,
+        'max_drawdown': max_drawdown,
+        'win_rate': win_rate,
+        'avg_profit_loss_ratio': avg_profit_loss_ratio,
+        'max_win_streak': max_win_streak,
+        'max_loss_streak': max_loss_streak
+    }
+
+def plot_backtest_results(results_df, metrics):
+    """
+    Plot backtest results with enhanced visualization
+    
+    Args:
+        results_df (pandas.DataFrame): Backtest results
+        metrics (dict): Performance metrics
+    """
+    # Create plot
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), gridspec_kw={'height_ratios': [3, 1, 1]})
+    
+    # Plot equity curves
+    ax1.plot(results_df.index, results_df['dmt_v2_equity'], label='DMT v2 Strategy')
+    ax1.plot(results_df.index, results_df['buy_hold_equity'], label='Buy & Hold', linestyle='--')
+    
+    # Add metrics to the plot
+    ax1.set_title('DMT v2 Backtest Results', fontsize=14)
+    ax1.text(0.01, 0.95, f"Total Return: {metrics['total_return']:.2%}", transform=ax1.transAxes)
+    ax1.text(0.01, 0.90, f"CAGR: {metrics['cagr']:.2%}", transform=ax1.transAxes)
+    ax1.text(0.01, 0.85, f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}", transform=ax1.transAxes)
+    ax1.text(0.01, 0.80, f"Max Drawdown: {metrics['max_drawdown']:.2%}", transform=ax1.transAxes)
+    ax1.text(0.01, 0.75, f"Win Rate: {metrics['win_rate']:.2%}", transform=ax1.transAxes)
+    
+    ax1.set_ylabel('Portfolio Value ($)', fontsize=12)
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot positions
+    ax2.plot(results_df.index, results_df['position'], color='purple')
+    ax2.fill_between(results_df.index, results_df['position'], 0, where=results_df['position']>0, color='green', alpha=0.3)
+    ax2.fill_between(results_df.index, results_df['position'], 0, where=results_df['position']<0, color='red', alpha=0.3)
+    ax2.set_ylabel('Position Size', fontsize=12)
+    ax2.grid(True)
+    
+    # Plot drawdown
+    equity = results_df['dmt_v2_equity'].values
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity / peak - 1
+    
+    ax3.fill_between(results_df.index, drawdown, 0, color='red', alpha=0.3)
+    ax3.set_ylabel('Drawdown', fontsize=12)
+    ax3.set_xlabel('Date', fontsize=12)
+    ax3.grid(True)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure
+    os.makedirs('tri_shot_data', exist_ok=True)
+    plt.savefig(os.path.join('tri_shot_data', 'dmt_v2_backtest.png'))
+    plt.close()
