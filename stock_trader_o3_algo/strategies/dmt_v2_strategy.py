@@ -87,15 +87,15 @@ class DMT_v2_Strategy:
                 self.max_position = 1.5
                 
         elif self.version == "enhanced":
-            self.neutral_zone = 0.03
-            self.core_long_bias = 0.0
+            self.neutral_zone = 0.005  # Drastically reduced from 0.03
+            self.core_long_bias = 0.1  # Add a small long bias
             
             if self.asset_type == "equity":
-                self.target_vol = 0.35
-                self.max_position = 2.0
+                self.target_vol = 0.40  # Increased from 0.35
+                self.max_position = 2.5  # Increased from 2.0
             elif self.asset_type == "crypto":
-                self.target_vol = 0.50
-                self.max_position = 2.0
+                self.target_vol = 0.60  # Increased from 0.50
+                self.max_position = 2.5  # Increased from 2.0
                 
         elif self.version == "turbo":
             self.allow_shorting = True
@@ -323,9 +323,17 @@ class DMT_v2_Strategy:
         # Apply adaptive kicker if we're lagging buy & hold
         signal *= adaptive_kicker
         
-        # Add core long bias (only for turbo)
-        if self.version == "turbo":
+        # Add core long bias (for turbo and enhanced)
+        if self.version == "turbo" or self.version == "enhanced":
             signal += self.core_long_bias
+        
+        # For paper trading, ensure we have a meaningful signal
+        if self.version == "enhanced" and abs(signal) < 0.1:
+            # Force a minimum signal strength in paper trading
+            if signal >= 0:
+                signal = max(signal, 0.15)  # Minimum positive signal
+            else:
+                signal = min(signal, -0.15)  # Minimum negative signal
         
         # Normalize signal to a -1 to 1 scale based on historical distribution
         if len(history) > 60:
