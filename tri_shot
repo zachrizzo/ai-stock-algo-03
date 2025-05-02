@@ -1,2 +1,12 @@
 #!/bin/bash
-./bin/trader_cli.py tri_shot "$@"
+# Compatibility wrapper for tri_shot
+# This forwards to the new unified CLI at scripts/trade.py
+
+# Get the directory of this script
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Find the project root (parent of the directory containing this script)
+PROJECT_ROOT="$( cd "$DIR/.." && pwd )"
+
+# Forward to the new CLI
+"$PROJECT_ROOT/scripts/trade.py" tri_shot "$@"

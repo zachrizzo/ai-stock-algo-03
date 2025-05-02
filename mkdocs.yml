@@ -1,0 +1,46 @@
+site_name: Stock Trader O3 Algorithm
+site_description: Documentation for the Stock Trader O3 Algorithm project
+site_author: Zach Rizzo
+repo_url: https://github.com/zachrizzo/ai-stock-algo-03
+theme:
+  name: material
+  palette:
+    primary: indigo
+    accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.instant
+    - navigation.sections
+    - content.code.copy
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - pymdownx.details
+  - pymdownx.tabbed
+  - pymdownx.arithmatex:
+      generic: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quick-start.md
+  - Strategies:
+    - Overview: strategies/overview.md
+    - DMT v2: strategies/dmt-v2.md
+    - TurboDMT v2: strategies/turbo-dmt-v2.md
+    - Tri-Shot: strategies/tri-shot.md
+    - Turbo QT: strategies/turbo-qt.md
+  - Modules:
+    - Backtester: modules/backtester.md
+    - Data Utilities: modules/data-utils.md
+    - Market Regimes: modules/market-regimes.md
+  - API Reference:
+    - CLI: api/cli.md
+    - Strategies: api/strategies.md
+    - Backtester: api/backtester.md
+  - Examples:
+    - Backtests: examples/backtests.md
+    - Paper Trading: examples/paper-trading.md
