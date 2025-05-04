@@ -38,6 +38,10 @@ import random
 import traceback
 from colorama import Fore, Back, Style, init
 import math
+import signal
+
+# Import the simulation model
+from simulation_model import SimulationAccount
 
 # Initialize colorama for cross-platform color support
 init()
@@ -78,7 +82,8 @@ class BinancePaperTrader:
         use_bnb_for_fees: bool = True,
         trading_tier: str = "regular",
         simulation_mode: bool = False,
-        use_binance_us: bool = False
+        use_binance_us: bool = False,
+        reset_on_start: bool = True
     ):
         """
         Initialize the Binance paper trader
@@ -88,26 +93,42 @@ class BinancePaperTrader:
             api_secret: Binance API secret (TESTNET ONLY!)
             symbol: Trading symbol (e.g., BTCUSDT)
             interval: Trading interval
-            initial_capital: Initial capital for paper trading
+            initial_capital: Initial capital for paper trading (used only in simulation mode)
             strategy_version: Strategy version to use
             asset_type: Asset type (crypto only for now)
             use_bnb_for_fees: Whether to use BNB for fee discount
             trading_tier: Trading tier for fee calculation
             simulation_mode: If True, don't attempt actual API trades
             use_binance_us: If True, use Binance US API instead of global
+            reset_on_start: If True, reset positions to start fresh with initial_capital
         """
         self.api_key = api_key
         self.api_secret = api_secret
         self.symbol = symbol
         self.interval = interval
-        self.capital = initial_capital
-        self.initial_capital = initial_capital
+        self.user_specified_capital = initial_capital  # Store user-specified capital for reference
         self.strategy_version = strategy_version
         self.asset_type = asset_type
         self.use_bnb_for_fees = use_bnb_for_fees
         self.trading_tier = trading_tier.lower()
         self.simulation_mode = simulation_mode
         self.use_binance_us = use_binance_us
+        self.reset_on_start = reset_on_start
+        self.reset_cooldown = False  # Flag to indicate we're in cooldown after reset
+        self.reset_time = None  # Time when reset was performed
+        self.account_reset = False  # Flag to indicate if the account has been reset
+        
+        # Extract base and quote assets from symbol
+        self.base_asset = self.symbol.replace('USDT', '')
+        self.quote_asset = 'USDT'
+        
+        # Initialize simulation account for tracking balances
+        self.sim_account = SimulationAccount(
+            initial_capital=initial_capital,
+            base_asset=self.base_asset,
+            quote_asset=self.quote_asset,
+            fee_rate=self._get_fee_rate()
+        )
         
         # Track price history for mini-chart
         self.price_history = []
@@ -123,6 +144,13 @@ class BinancePaperTrader:
         self.max_position_value_pct = 0
         self.risk_per_trade_pct = 1.0  # Default 1% risk per trade
         self.volatility = 0
+        
+        # Initialize trading states early to avoid attribute errors
+        self.positions = []
+        self.trades = []
+        self.total_fees_paid = 0.0
+        self.trading_volume_30d = 0.0  # 30-day trading volume for fee calculation
+        self.last_signal = 0.0  # Initialize last signal
         
         # Configure client based on user settings
         try:
@@ -150,35 +178,102 @@ class BinancePaperTrader:
                         if account_info and 'balances' in account_info:
                             print("✅ Trading permissions verified")
                             self.simulation_mode = False
+                            
+                            # Get actual balances from Binance Testnet
+                            usdt_balance = 0.0
+                            base_asset = self.symbol[:-4] if self.symbol.endswith('USDT') else self.symbol[:3]
+                            base_balance = 0.0
+                            
+                            for asset in account_info['balances']:
+                                if asset['asset'] == 'USDT':
+                                    usdt_balance = float(asset['free'])
+                                elif asset['asset'] == base_asset:
+                                    base_balance = float(asset['free'])
+                            
+                            # Get current price to calculate total equity
+                            try:
+                                ticker = self.client.get_ticker(symbol=self.symbol)
+                                current_price = float(ticker['lastPrice'])
+                                self.current_price = current_price
+                                
+                                # Calculate total equity
+                                total_equity = usdt_balance + (base_balance * current_price)
+                                print(f"✅ Retrieved actual balance from Binance Testnet: ${total_equity:.2f}")
+                                print(f"   USDT: ${usdt_balance:.2f}, {base_asset}: {base_balance:.8f}")
+                                
+                                # Reset positions if requested
+                                if reset_on_start and base_balance > 0:
+                                    print(f"🔄 Resetting positions to start fresh...")
+                                    self._reset_positions(base_asset, base_balance)
+                                    
+                                    # Get updated balances after reset
+                                    account_info = self.client.get_account()
+                                    for asset in account_info['balances']:
+                                        if asset['asset'] == 'USDT':
+                                            usdt_balance = float(asset['free'])
+                                        elif asset['asset'] == base_asset:
+                                            base_balance = float(asset['free'])
+                                    
+                                    # Recalculate total equity
+                                    total_equity = usdt_balance + (base_balance * current_price)
+                                    print(f"✅ Updated balance after reset: ${total_equity:.2f}")
+                                    print(f"   USDT: ${usdt_balance:.2f}, {base_asset}: {base_balance:.8f}")
+                                
+                                # Use actual balance as initial capital
+                                self.initial_capital = initial_capital  # Use user-specified capital
+                                self.capital = usdt_balance
+                                self.holdings = base_balance
+                                self.equity = total_equity
+                                
+                            except Exception as e:
+                                print(f"⚠️ Couldn't get current price: {e}")
+                                print(f"⚠️ Using user-specified initial capital: ${initial_capital:.2f}")
+                                self.initial_capital = initial_capital
+                                self.capital = initial_capital
+                                self.holdings = 0.0
+                                self.equity = initial_capital
                         else:
                             print("⚠️ Trading permissions not detected - using simulation mode only")
                             self.simulation_mode = True
+                            self.initial_capital = initial_capital
+                            self.capital = initial_capital
+                            self.holdings = 0.0
+                            self.equity = initial_capital
                     except Exception as e:
                         print(f"⚠️ Couldn't verify trading permissions: {e}")
                         print("⚠️ Using simulation mode only")
                         self.simulation_mode = True
+                        self.initial_capital = initial_capital
+                        self.capital = initial_capital
+                        self.holdings = 0.0
+                        self.equity = initial_capital
+                else:
+                    # In simulation mode, use user-specified initial capital
+                    self.initial_capital = initial_capital
+                    self.capital = initial_capital
+                    self.holdings = 0.0
+                    self.equity = initial_capital
             except Exception as e:
-                print(f"⚠️ Couldn't verify trading permissions: {e}")
-                print("⚠️ Using simulation mode only")
+                print(f"⚠️ Warning: API connection issue: {e}")
+                print("⚠️ Running in full simulation mode")
                 self.simulation_mode = True
-                
+                self.client = None
+                self.initial_capital = initial_capital
+                self.capital = initial_capital
+                self.holdings = 0.0
+                self.equity = initial_capital
         except Exception as e:
             print(f"⚠️ Warning: API connection issue: {e}")
             print("⚠️ Running in full simulation mode")
             self.simulation_mode = True
             self.client = None
+            self.initial_capital = initial_capital
+            self.capital = initial_capital
+            self.holdings = 0.0
+            self.equity = initial_capital
         
         # Initialize fee structure for fee calculation
         self.fee_structure = self._initialize_fee_structure()
-        
-        # Initialize trading states
-        self.cash = initial_capital
-        self.holdings = 0.0
-        self.equity = initial_capital
-        self.positions = []
-        self.trades = []
-        self.total_fees_paid = 0.0
-        self.trading_volume_30d = 0.0  # 30-day trading volume for fee calculation
         
         # Initialize strategy
         self.strategy = DMT_v2_Strategy(
@@ -268,28 +363,18 @@ class BinancePaperTrader:
     def _load_initial_data(self):
         """Load initial historical data"""
         try:
-            # Determine how many bars to load based on interval
-            lookback_periods = {
-                '1m': 5000,   # More 1-minute data for better context
-                '5m': 1000,   # More 5-minute data (3+ days)
-                '15m': 500,   # More 15-minute data (5+ days)
-                '30m': 300,   # More 30-minute data (6+ days)
-                '1h': 200,    # More hourly data (8+ days)
-                '4h': 150,    # More 4-hour data (25+ days)
-                '1d': 200     # More daily data (6+ months)
-            }
+            # Get historical data
+            print(f"\n📊 Preloading {200} historical {self.interval} bars to build context...")
+            bars_to_load = 200
             
-            # Get the number of bars to load
-            bars_to_load = lookback_periods.get(self.interval, 100)
-            
-            print(f"\n📊 Preloading {bars_to_load} historical {self.interval} bars to build context...")
-            
-            # Get historical klines
             klines = self.client.get_klines(
                 symbol=self.symbol,
                 interval=self.interval,
                 limit=bars_to_load
             )
+            
+            if not klines or len(klines) < 2:
+                return False
             
             # Parse klines
             self.klines = []
@@ -310,6 +395,9 @@ class BinancePaperTrader:
             if self.klines:
                 self.last_timestamp = self.klines[-1]['timestamp']
                 self.current_price = self.klines[-1]['close']
+                
+                # Add to price history for chart
+                self.price_history.append(self.current_price)
             
             # Create a DataFrame with column names that match what the strategy expects
             # The DMT_v2 strategy expects uppercase first letter: 'Open', 'High', 'Low', 'Close', 'Volume'
@@ -333,8 +421,22 @@ class BinancePaperTrader:
             print(f"✅ Loaded {len(self.klines)} bars of {self.interval} historical data")
             print(f"📋 Data columns: {', '.join(df.columns.tolist())}")
             
-            # Pre-calculate initial signals based on historical data
+            # Build context from historical data
             self._build_context_and_initialize()
+            
+            # Check if this is a new candle we haven't processed
+            latest_candle = {
+                'open_time': int(klines[-1][0]),
+                'open': float(klines[-1][1]),
+                'high': float(klines[-1][2]),
+                'low': float(klines[-1][3]),
+                'close': float(klines[-1][4]),
+                'volume': float(klines[-1][5]),
+                'close_time': datetime.fromtimestamp(int(klines[-1][6])/1000)
+            }
+            
+            # Store the last candle time
+            self.last_candle_time = latest_candle['open_time']
             
             return True
             
@@ -342,7 +444,7 @@ class BinancePaperTrader:
             logger.error(f"Error loading historical data: {e}")
             print(f"❌ Error loading historical data: {e}")
             sys.exit(1)
-    
+            
     def _build_context_and_initialize(self):
         """Build context from historical data and initialize the model"""
         print("\n🧠 Building model context from historical data...")
@@ -396,9 +498,6 @@ class BinancePaperTrader:
                     bar = '█' * filled_length + '░' * (bar_length - filled_length)
                     print(f"\r[{bar}] {progress}% | Processed {i+1}/{len(self.klines)} bars", end="")
                     
-                    # For non-minute timeframes, also print average position size
-                    if self.interval != '1m' or i % (5 * step_size) == 0:
-                        backtest_results, _ = self.strategy.run_backtest(temp_df)
                 except Exception as e:
                     # Just continue with progress if we can't calculate signal yet
                     progress = int((i / len(self.klines)) * 100)
@@ -435,11 +534,75 @@ class BinancePaperTrader:
             # Enforce a proper range for the signal (-1.0 to 1.0)
             signal = max(min(float(signal), 1.0), -1.0)
             
+            # Print completion message
+            print(f"\n✅ Model context built successfully")
+            print(f"📊 Current signal: {signal:.4f}")
+            if regime != "Unknown":
+                print(f"🌐 Market regime: {regime}")
+            
             return signal
             
         except Exception as e:
             logger.error(f"Error calculating signal: {e}")
             return 0.0
+    
+    def _process_new_candle(self, candle):
+        """Process a new candle of data"""
+        try:
+            # Add candle to klines
+            dt_obj = datetime.fromtimestamp(candle['open_time'] / 1000)
+            new_candle = {
+                'timestamp': candle['open_time'],
+                'datetime': dt_obj,
+                'open': candle['open'],
+                'high': candle['high'],
+                'low': candle['low'],
+                'close': candle['close'],
+                'volume': candle['volume']
+            }
+            self.klines.append(new_candle)
+            
+            # Update current price
+            self.current_price = candle['close']
+            
+            # Add to price history for chart
+            self.price_history.append(self.current_price)
+            if len(self.price_history) > self.max_price_history:
+                self.price_history = self.price_history[-self.max_price_history:]
+            
+            # Update the DataFrame for the strategy
+            # Create a new row for the strategy DataFrame
+            new_row = pd.DataFrame([{
+                'Open': candle['open'],
+                'High': candle['high'],
+                'Low': candle['low'],
+                'Close': candle['close'],
+                'Volume': candle['volume'],
+                'Date': dt_obj
+            }])
+            new_row.set_index('Date', inplace=True)
+            
+            # Append to the strategy's historical data
+            if hasattr(self.strategy, 'historical_data'):
+                self.strategy.historical_data = pd.concat([self.strategy.historical_data, new_row])
+            else:
+                # If historical_data doesn't exist, create it
+                self.strategy.historical_data = new_row
+            
+            # Log the new candle
+            logging.info(f"New {self.interval} candle: O:{candle['open']:.2f} H:{candle['high']:.2f} L:{candle['low']:.2f} C:{candle['close']:.2f} V:{candle['volume']:.2f}")
+            
+            # Calculate signal with the new data
+            signal = self._calculate_signal()
+            
+            # Execute trade based on signal
+            self._execute_trade(signal)
+            
+            # Update status with enhanced dashboard
+            self._update_status()
+            
+        except Exception as e:
+            logger.error(f"Error processing new candle: {e}")
     
     def _check_for_new_data(self) -> bool:
         """Check if there is new market data available"""
@@ -477,108 +640,43 @@ class BinancePaperTrader:
             logger.error(f"Error checking for new data: {e}")
             return False
     
-    def _process_new_candle(self, candle):
-        """Process a new candle of data"""
-        try:
-            # Add new data to historical_data
-            if self.strategy.historical_data is not None and len(self.strategy.historical_data) > 0:
-                # Convert candle to DataFrame with same format as historical_data
-                columns = self.strategy.historical_data.columns
-                if len(columns) >= 5:  # OHLCV format
-                    new_candle = pd.DataFrame({
-                        'Open': [float(candle['open'])],
-                        'High': [float(candle['high'])],
-                        'Low': [float(candle['low'])],
-                        'Close': [float(candle['close'])],
-                        'Volume': [float(candle['volume'])]
-                    })
-                    
-                    # Update current price and volume
-                    self.current_price = float(candle['close'])
-                    self.current_volume = float(candle['volume'])
-                else:
-                    logger.warning(f"Unexpected columns in historical_data: {columns}")
-                    return
-                
-                # Append to historical_data
-                try:
-                    self.strategy.historical_data = pd.concat([self.strategy.historical_data, new_candle], ignore_index=True)
-                    # Keep only recent data to prevent memory issues
-                    max_bars = 5000  # Keep last 5000 bars
-                    if len(self.strategy.historical_data) > max_bars:
-                        self.strategy.historical_data = self.strategy.historical_data.iloc[-max_bars:]
-                except Exception as e:
-                    logger.error(f"Error appending new candle to historical_data: {e}")
-                
-                # Log the new candle
-                close_time_str = candle['close_time'].strftime('%Y-%m-%d %H:%M') if isinstance(candle['close_time'], datetime) else 'Unknown'
-                print(f"📊 New {self.interval} candle: {close_time_str} | ${float(candle['close']):.2f} | Vol: {float(candle['volume']):.2f}")
-                
-                # Calculate average position size across recent data
-                try:
-                    # First try from strategy results
-                    if hasattr(self.strategy, 'backtest_results') and self.strategy.backtest_results is not None:
-                        if 'position' in self.strategy.backtest_results.columns:
-                            avg_pos = self.strategy.backtest_results['position'].abs().mean()
-                            print(f"  Average position size: {avg_pos:.2f}")
-                        elif 'signal' in self.strategy.backtest_results.columns:
-                            avg_sig = self.strategy.backtest_results['signal'].abs().mean()
-                            print(f"  Average signal strength: {avg_sig:.2f}")
-                except Exception as e:
-                    logger.error(f"Error calculating average position: {e}")
-                
-                # Update equity calculation to include holdings
-                self.equity = self.capital + (self.holdings * self.current_price)
-            
-        except Exception as e:
-            logger.error(f"Error processing new candle: {e}")
-    
     def _calculate_signal(self) -> float:
         """
         Calculate trading signal from strategy
         """
         try:
-            # Create a DataFrame from the klines data
-            df = pd.DataFrame([
-                {
-                    'Open': k['open'],
-                    'High': k['high'],
-                    'Low': k['low'],
-                    'Close': k['close'],
-                    'Volume': k['volume'],
-                    'Date': k['datetime']
-                } for k in self.klines
-            ])
-            
-            # Set the index for the strategy
-            df.set_index('Date', inplace=True)
-            
-            # Update strategy data
-            self.strategy.historical_data = df
-            
+            # Check if we have enough data
+            if not hasattr(self.strategy, 'historical_data') or self.strategy.historical_data is None or len(self.strategy.historical_data) < 2:
+                logging.error("Not enough historical data to calculate signal")
+                return 0.0
+                
             # Get the signal from the strategy
             signal = 0.0
-            
-            # For DMT_v2 strategy
             if hasattr(self.strategy, 'run_backtest'):
                 # Run backtest to get the latest signal
-                backtest_results, _ = self.strategy.run_backtest(df)
+                backtest_results, _ = self.strategy.run_backtest(self.strategy.historical_data)
                 if len(backtest_results) > 0:
                     signal = backtest_results['signal'].iloc[-1]
             
             # For enhanced version, ensure we have a meaningful signal for paper trading
             if self.strategy_version == "enhanced" and abs(signal) < 0.1:
-                # Force a minimum signal strength for paper trading
+                # Force a minimum signal for paper trading
                 if signal >= 0:
-                    signal = 0.3  # Force a significant long position
+                    signal = 0.3  # Force a significant long signal
                 else:
-                    signal = -0.3  # Force a significant short position
-                logger.info(f"Forcing signal for paper trading: {signal:.2f}")
+                    signal = -0.3  # Force a significant short signal
+                logging.info(f"Forcing signal for paper trading: {signal:.2f}")
+            
+            # Store the signal for status updates
+            self.last_signal = signal
+            
+            # Update status with enhanced dashboard after signal calculation
+            self._update_status()
             
             return signal
             
         except Exception as e:
-            logger.error(f"Error calculating signal: {e}")
+            logging.error(f"Error calculating signal: {e}")
             return 0.0
     
     def _update_market_data(self):
@@ -628,6 +726,16 @@ class BinancePaperTrader:
         """Execute trade based on signal"""
         self.last_signal = signal  # Store for status updates
         
+        # If we're in reset cooldown, don't execute trades
+        if self.reset_cooldown:
+            cooldown_seconds = 30  # 30 seconds cooldown after reset
+            if self.reset_time and (datetime.now() - self.reset_time).total_seconds() < cooldown_seconds:
+                logging.info(f"In reset cooldown, skipping trade execution for {cooldown_seconds} seconds")
+                return False
+            else:
+                # Cooldown period is over
+                self.reset_cooldown = False
+        
         # If signal is very close to zero, don't trade
         if abs(signal) < 0.001:
             logging.info("Signal too small, no trade executed")
@@ -645,169 +753,178 @@ class BinancePaperTrader:
                 target_position_size = -0.3  # Force a significant short position
             logging.info(f"Forcing position adjustment for paper trading: {target_position_size:.2f}")
         
-        # Get current account information from Binance Testnet
-        try:
-            if not self.simulation_mode and self.client:
-                account_info = self.client.get_account()
-                
-                # Find USDT balance
-                usdt_balance = 0.0
-                btc_balance = 0.0
-                
-                for asset in account_info['balances']:
-                    if asset['asset'] == 'USDT':
-                        usdt_balance = float(asset['free'])
-                    elif asset['asset'] == 'BTC':
-                        btc_balance = float(asset['free'])
-                
-                # Update our local tracking with testnet values
-                self.capital = usdt_balance
-                self.holdings = btc_balance
-                
-                # Calculate current position size as a decimal
-                current_position_value = self.holdings * self.current_price
-                current_total_equity = self.capital + current_position_value
-                current_position_size = current_position_value / current_total_equity if current_total_equity > 0 else 0
-                
-                # Calculate the difference in position size
-                position_size_diff = target_position_size - current_position_size
-                
-                # Skip if there's no meaningful change needed
-                min_adjustment_pct = 0.01  # 1% minimum adjustment threshold
-                if abs(position_size_diff) < min_adjustment_pct:
-                    logging.info("Position adjustment too small, maintaining current position")
-                    return False
-                    
-                # Calculate the amount to buy or sell in base currency units
-                position_value_diff = position_size_diff * current_total_equity
-                amount_diff = position_value_diff / self.current_price if self.current_price > 0 else 0
-                
-                # Execute the trade on Binance Testnet
-                if amount_diff > 0:  # Buy
-                    # Check if we have enough capital
-                    if self.capital < position_value_diff:
-                        logging.info(f"Not enough capital for position increase. Need ${position_value_diff:.2f}, have ${self.capital:.2f}")
-                        return False
-                    
-                    # Calculate quantity with precision
-                    quantity = self._format_quantity(amount_diff)
-                    
-                    # Check minimum notional value (usually 10 USDT on Binance)
-                    if float(quantity) * self.current_price < 10:
-                        logging.info(f"Order too small: ${float(quantity) * self.current_price:.2f} is below minimum notional value of $10")
-                        return False
-                    
-                    # Execute market buy order
-                    try:
-                        # First test the order
-                        order = self.client.create_test_order(
-                            symbol=self.symbol,
-                            side='BUY',
-                            type='MARKET',
-                            quantity=quantity
-                        )
-                        
-                        # If test order successful, place real order
-                        order = self.client.create_order(
-                            symbol=self.symbol,
-                            side='BUY',
-                            type='MARKET',
-                            quantity=quantity
-                        )
-                        
-                        # Log the trade
-                        price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else self.current_price
-                        executed_qty = float(order['executedQty']) if 'executedQty' in order else amount_diff
-                        trade_value = price * executed_qty
-                        
-                        logging.info(f"BUY {executed_qty:.8f} BTC at ${price:.2f}")
-                        logging.info(f"Trade value: ${trade_value:.2f}")
-                        
-                        # Record the trade
-                        self.trades.append({
-                            'timestamp': datetime.now(),
-                            'type': 'buy',
-                            'price': price,
-                            'amount': executed_qty,
-                            'value': trade_value,
-                            'order_id': order.get('orderId', 'unknown')
-                        })
-                        
-                        print(f"💰 Trade executed: BUY {executed_qty:.6f} BTC at ${price:.2f}")
-                        
-                        return True
-                    except Exception as e:
-                        logging.error(f"Error executing buy order: {e}")
-                        return False
-                        
-                elif amount_diff < 0:  # Sell
-                    amount_to_sell = abs(amount_diff)
-                    
-                    # Check if we have enough holdings
-                    if self.holdings < amount_to_sell:
-                        logging.info(f"Not enough holdings to sell. Need {amount_to_sell:.8f} BTC, have {self.holdings:.8f} BTC")
-                        return False
-                        
-                    # Calculate quantity with precision
-                    quantity = self._format_quantity(amount_to_sell)
-                    
-                    # Check minimum notional value (usually 10 USDT on Binance)
-                    if float(quantity) * self.current_price < 10:
-                        logging.info(f"Order too small: ${float(quantity) * self.current_price:.2f} is below minimum notional value of $10")
-                        return False
-                    
-                    # Execute market sell order
-                    try:
-                        # First test the order
-                        order = self.client.create_test_order(
-                            symbol=self.symbol,
-                            side='SELL',
-                            type='MARKET',
-                            quantity=quantity
-                        )
-                        
-                        # If test order successful, place real order
-                        order = self.client.create_order(
-                            symbol=self.symbol,
-                            side='SELL',
-                            type='MARKET',
-                            quantity=quantity
-                        )
-                        
-                        # Log the trade
-                        price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else self.current_price
-                        executed_qty = float(order['executedQty']) if 'executedQty' in order else amount_to_sell
-                        trade_value = price * executed_qty
-                        
-                        logging.info(f"SELL {executed_qty:.8f} BTC at ${price:.2f}")
-                        logging.info(f"Trade value: ${trade_value:.2f}")
-                        
-                        # Record the trade
-                        self.trades.append({
-                            'timestamp': datetime.now(),
-                            'type': 'sell',
-                            'price': price,
-                            'amount': executed_qty,
-                            'value': trade_value,
-                            'order_id': order.get('orderId', 'unknown')
-                        })
-                        
-                        print(f"💰 Trade executed: SELL {executed_qty:.6f} BTC at ${price:.2f}")
-                        
-                        return True
-                    except Exception as e:
-                        logging.error(f"Error executing sell order: {e}")
-                        return False
-            else:
-                # Simulation mode - log that we're not executing real trades
-                logging.info("No trades executed - simulation mode")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Error in trade execution: {e}")
+        # Get the current price with retry logic
+        current_price = self._get_current_price_with_retry()
+        if current_price is None:
+            logging.error("Failed to get current price after retries, skipping trade execution")
             return False
             
-        return False
+        self.current_price = current_price
+        
+        # Calculate the target position in base asset quantity
+        # Use the simulation account's portfolio value
+        portfolio_value = self.sim_account.get_portfolio_value(current_price)
+        target_position_value = portfolio_value * target_position_size
+        target_position_qty = target_position_value / current_price
+        
+        # Get current position from simulation account
+        current_position_qty = self.sim_account.get_balance(self.base_asset)
+        current_position_value = current_position_qty * current_price
+        
+        # Calculate the difference in position
+        position_qty_diff = target_position_qty - current_position_qty
+        
+        # If the position adjustment is too small, skip it
+        min_trade_value = 10.0  # Minimum $10 trade
+        position_value_diff = position_qty_diff * current_price
+        if abs(position_value_diff) < min_trade_value:
+            logging.info("Position adjustment too small, maintaining current position")
+            return False
+        
+        # Format quantity according to Binance's precision requirements
+        quantity = self._format_quantity(abs(position_qty_diff))
+        
+        try:
+            # Determine if we're buying or selling
+            if position_qty_diff > 0:  # Buy
+                # Execute market buy order
+                if not self.simulation_mode:
+                    try:
+                        order = self.client.create_order(
+                            symbol=self.symbol,
+                            side='BUY',
+                            type='MARKET',
+                            quantity=quantity
+                        )
+                        
+                        # Log the trade
+                        price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else current_price
+                        executed_qty = float(order['executedQty']) if 'executedQty' in order else float(quantity)
+                        trade_value = price * executed_qty
+                        
+                        # Update the simulation account to match reality
+                        self.sim_account.execute_market_buy(
+                            symbol=self.symbol,
+                            quantity=executed_qty,
+                            price=price
+                        )
+                    except (BinanceAPIException, BinanceRequestException, requests.exceptions.RequestException) as e:
+                        logging.error(f"Error executing buy order on Binance: {e}")
+                        # Still execute the simulated trade
+                        price = current_price
+                        executed_qty = float(quantity)
+                        trade_value = price * executed_qty
+                        
+                        # Update simulation account
+                        self.sim_account.execute_market_buy(
+                            symbol=self.symbol,
+                            quantity=executed_qty,
+                            price=price
+                        )
+                        print(f"⚠️ API error, but simulated trade executed: BUY {executed_qty:.6f} {self.base_asset} @ ${price:.2f}")
+                else:
+                    # Simulated trade
+                    price = current_price
+                    executed_qty = float(quantity)
+                    trade_value = price * executed_qty
+                    
+                    # Update simulation account
+                    self.sim_account.execute_market_buy(
+                        symbol=self.symbol,
+                        quantity=executed_qty,
+                        price=price
+                    )
+                
+                logging.info(f"BUY {executed_qty:.8f} {self.base_asset} at ${price:.2f}")
+                logging.info(f"Trade value: ${trade_value:.2f}")
+                
+                print(f"🔄 BUY: {executed_qty:.6f} {self.base_asset} @ ${price:.2f}")
+                print(f"Trade value: ${trade_value:.2f}")
+                
+                # Record the trade
+                self.trades.append({
+                    'timestamp': datetime.now(),
+                    'type': 'buy',
+                    'price': price,
+                    'amount': executed_qty,
+                    'value': trade_value,
+                    'order_id': order.get('orderId', 'simulated') if not self.simulation_mode else 'simulated'
+                })
+                
+                return True
+                
+            elif position_qty_diff < 0:  # Sell
+                # Execute market sell order
+                if not self.simulation_mode:
+                    try:
+                        order = self.client.create_order(
+                            symbol=self.symbol,
+                            side='SELL',
+                            type='MARKET',
+                            quantity=quantity
+                        )
+                        
+                        # Log the trade
+                        price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else current_price
+                        executed_qty = float(order['executedQty']) if 'executedQty' in order else float(quantity)
+                        trade_value = price * executed_qty
+                        
+                        # Update the simulation account to match reality
+                        self.sim_account.execute_market_sell(
+                            symbol=self.symbol,
+                            quantity=executed_qty,
+                            price=price
+                        )
+                    except (BinanceAPIException, BinanceRequestException, requests.exceptions.RequestException) as e:
+                        logging.error(f"Error executing sell order on Binance: {e}")
+                        # Still execute the simulated trade
+                        price = current_price
+                        executed_qty = float(quantity)
+                        trade_value = price * executed_qty
+                        
+                        # Update simulation account
+                        self.sim_account.execute_market_sell(
+                            symbol=self.symbol,
+                            quantity=executed_qty,
+                            price=price
+                        )
+                        print(f"⚠️ API error, but simulated trade executed: SELL {executed_qty:.6f} {self.base_asset} @ ${price:.2f}")
+                else:
+                    # Simulated trade
+                    price = current_price
+                    executed_qty = float(quantity)
+                    trade_value = price * executed_qty
+                    
+                    # Update simulation account
+                    self.sim_account.execute_market_sell(
+                        symbol=self.symbol,
+                        quantity=executed_qty,
+                        price=price
+                    )
+                
+                logging.info(f"SELL {executed_qty:.8f} {self.base_asset} at ${price:.2f}")
+                logging.info(f"Trade value: ${trade_value:.2f}")
+                
+                print(f"🔄 SELL: {executed_qty:.6f} {self.base_asset} @ ${price:.2f}")
+                print(f"Trade value: ${trade_value:.2f}")
+                
+                # Record the trade
+                self.trades.append({
+                    'timestamp': datetime.now(),
+                    'type': 'sell',
+                    'price': price,
+                    'amount': executed_qty,
+                    'value': trade_value,
+                    'order_id': order.get('orderId', 'simulated') if not self.simulation_mode else 'simulated'
+                })
+                
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error executing trade: {e}")
+            return False
     
     def _format_quantity(self, quantity: float) -> str:
         """Format quantity according to Binance's precision requirements"""
@@ -816,12 +933,32 @@ class BinancePaperTrader:
         quantity = math.floor(quantity * 100000) / 100000
         return "{:.5f}".format(quantity)
     
-    def _get_fee_rate(self, is_maker: bool = False) -> float:
-        """Get the fee rate based on current tier and maker/taker status"""
+    def _get_fee_rate(self) -> float:
+        """
+        Get the trading fee rate based on the trading tier.
+        
+        Returns:
+            Fee rate as a decimal (e.g., 0.001 for 0.1%)
+        """
+        # Fee rates based on trading tier
+        fee_rates = {
+            'vip': 0.00075,  # VIP tier: 0.075%
+            'regular': 0.001,  # Regular tier: 0.1%
+            'maker': 0.0009,  # Maker fee: 0.09%
+            'taker': 0.001    # Taker fee: 0.1%
+        }
+        
+        # Use BNB discount if enabled (25% discount)
         if self.use_bnb_for_fees:
-            return self.fee_structure[self.trading_tier]['bnb_maker_fee'] if is_maker else self.fee_structure[self.trading_tier]['bnb_taker_fee']
+            discount = 0.25
         else:
-            return self.fee_structure[self.trading_tier]['maker_fee'] if is_maker else self.fee_structure[self.trading_tier]['taker_fee']
+            discount = 0
+            
+        # Get base fee rate for the tier
+        base_fee = fee_rates.get(self.trading_tier.lower(), 0.001)
+        
+        # Apply discount
+        return base_fee * (1 - discount)
     
     def _calculate_position_size(self, signal: float) -> float:
         """
@@ -892,199 +1029,145 @@ class BinancePaperTrader:
         return position_size
     
     def _update_status(self):
-        """Print status update with current position and account value"""
-        # Get account info from Binance if not in simulation mode
-        if not self.simulation_mode and self.client:
+        """Update and display trading status"""
+        try:
+            # Get current price with retry logic
+            current_price = self._get_current_price_with_retry()
+            if current_price is None:
+                # If we can't get the current price, use the last known price
+                if hasattr(self, 'current_price') and self.current_price > 0:
+                    current_price = self.current_price
+                    logging.warning(f"Using last known price for status update: ${current_price:.2f}")
+                else:
+                    logging.error("Failed to get current price for status update")
+                    return False
+            
+            self.current_price = current_price
+            
+            # Get balances from simulation account
+            cash_balance = self.sim_account.get_balance(self.quote_asset)
+            holdings_balance = self.sim_account.get_balance(self.base_asset)
+            
+            # Calculate portfolio value using simulation account
+            portfolio_value = self.sim_account.get_portfolio_value(current_price)
+            
+            # Calculate profit/loss based on initial capital
+            pnl, pnl_pct = self.sim_account.get_pnl(current_price)
+            
+            # Get position value and percentage
+            position_value, position_pct = self.sim_account.get_position_size(current_price)
+            
+            # Update best profit and worst drawdown
+            if pnl > self.best_profit:
+                self.best_profit = pnl
+            
+            drawdown = self.best_profit - pnl
+            if drawdown > self.worst_drawdown:
+                self.worst_drawdown = drawdown
+            
+            # Count trades by type
+            buy_trades = sum(1 for trade in self.trades if trade['type'] == 'buy')
+            sell_trades = sum(1 for trade in self.trades if trade['type'] == 'sell')
+            
+            # Calculate win rate if we have closed trades
+            win_rate = "N/A"
+            profit_factor = "N/A"
+            
+            # Create a beautiful boxed dashboard with emojis and sections
+            # Using box drawing characters for a clean look
+            os.system('clear' if os.name == 'posix' else 'cls')
+            
+            # Get current time for the dashboard header
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Create visual indicators for signal and position
+            signal_indicator = self._create_visual_indicator(abs(self.last_signal))
+            position_indicator = self._create_visual_indicator(position_pct / 100)
+            
+            # Format 24h volume with error handling
             try:
-                account_info = self.client.get_account()
-                
-                # Find USDT and BTC balances
-                for asset in account_info['balances']:
-                    if asset['asset'] == 'USDT':
-                        self.capital = float(asset['free'])
-                    elif asset['asset'] == 'BTC':
-                        self.holdings = float(asset['free'])
+                volume_24h = self._get_24h_volume()
             except Exception as e:
-                logging.error(f"Error getting account info: {e}")
-        
-        # Calculate position value and total equity
-        position_value = self.holdings * self.current_price if self.current_price > 0 else 0
-        total_equity = self.capital + position_value
-        profit_loss = total_equity - self.initial_capital
-        profit_loss_pct = (profit_loss / self.initial_capital) * 100 if self.initial_capital > 0 else 0
-        
-        # Update equity history and track max profit/drawdown
-        self.equity_history.append(total_equity)
-        if len(self.equity_history) > self.max_price_history * 2:  # Keep more equity history points
-            self.equity_history = self.equity_history[-self.max_price_history * 2:]
+                logging.error(f"Error getting 24h volume: {e}")
+                volume_24h = "N/A"
             
-        if profit_loss > self.best_profit:
-            self.best_profit = profit_loss
+            # Format numbers for display
+            formatted_price = f"${self.current_price:.2f}"
+            formatted_cash = f"${cash_balance:.2f}"
+            formatted_position_value = f"${position_value:.2f}"
             
-        current_drawdown = self.best_profit - profit_loss
-        if current_drawdown > self.worst_drawdown:
-            self.worst_drawdown = current_drawdown
-        
-        # Determine if we're up or down
-        if profit_loss > 0:
-            pl_color = Fore.GREEN
-        elif profit_loss < 0:
-            pl_color = Fore.RED
-        else:
-            pl_color = Fore.WHITE
-        
-        # Current time
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Count buys and sells
-        buy_count = sum(1 for trade in self.trades if trade['type'] == 'buy')
-        sell_count = sum(1 for trade in self.trades if trade['type'] == 'sell')
-        
-        # Calculate total fees paid
-        total_fees = sum(trade.get('fee', 0) for trade in self.trades)
-        
-        # Calculate win/loss ratio if we have trades
-        win_count = 0
-        loss_count = 0
-        avg_win = 0
-        avg_loss = 0
-        
-        if len(self.trades) > 1:
-            # Calculate profit/loss for each trade
-            for i in range(1, len(self.trades)):
-                prev_trade = self.trades[i-1]
-                curr_trade = self.trades[i]
+            # Determine if we're showing profit or loss
+            if pnl >= 0:
+                pnl_display = f"P&L: ${pnl:.2f} (+{pnl_pct:.2f}%)"
+            else:
+                pnl_display = f"P&L: $-{abs(pnl):.2f} ({pnl_pct:.2f}%)"
+            
+            # Create the dashboard
+            print("╔══════════════════════════════════════════════════════════╗")
+            print(f"║ 📈 DMT_v2 PAPER TRADING DASHBOARD - {current_time} ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 📊 MARKET DATA                                             ║")
+            print(f"║ Symbol: {self.symbol} | Price: {formatted_price} | 24h Vol: {volume_24h}     ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            
+            # Show different header for reset accounts
+            if self.account_reset:
+                print("║ 💰 PORTFOLIO SUMMARY (SIMULATED)                           ║")
+            else:
+                print("║ 💰 PORTFOLIO SUMMARY                                       ║")
                 
-                if prev_trade['type'] != curr_trade['type']:  # Only count completed round trips
-                    if prev_trade['type'] == 'buy' and curr_trade['type'] == 'sell':
-                        # Buy then sell - calculate profit
-                        buy_value = prev_trade['price'] * prev_trade['amount']
-                        sell_value = curr_trade['price'] * curr_trade['amount']
-                        trade_pl = sell_value - buy_value
-                        
-                        if trade_pl > 0:
-                            win_count += 1
-                            avg_win += trade_pl
-                        else:
-                            loss_count += 1
-                            avg_loss += abs(trade_pl)
+            print(f"║ Cash: {formatted_cash.ljust(25)} | Total Value: ${portfolio_value:.2f}     ║")
+            print(f"║ Holdings: {holdings_balance:.6f} {self.base_asset} ({formatted_position_value})                       ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 📊 PERFORMANCE METRICS                                      ║")
+            print(f"║ Initial: ${self.user_specified_capital:.2f}             | {pnl_display}  ║")
+            print(f"║ Best Profit: ${self.best_profit:.2f}         | Max Drawdown: ${self.worst_drawdown:.2f}            ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 🔄 TRADING ACTIVITY                                         ║")
+            print(f"║ Total Trades: {len(self.trades)}                    | Buy: {buy_trades} | Sell: {sell_trades}    ║")
+            print(f"║ Win Rate: {win_rate}                     | Profit Factor: {profit_factor}               ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 🧠 STRATEGY INFO                                           ║")
+            print(f"║ Version: {self.strategy_version.ljust(20)} | Signal: {self.last_signal:.4f} {signal_indicator}              ║")
+            print(f"║ Position: {position_pct:.1f}% of capital {position_indicator}                        ║")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 📝 RECENT TRADES                                           ║")
             
-            # Calculate averages
-            avg_win = avg_win / win_count if win_count > 0 else 0
-            avg_loss = avg_loss / loss_count if loss_count > 0 else 0
-            win_rate = (win_count / (win_count + loss_count)) * 100 if (win_count + loss_count) > 0 else 0
-            profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
-        
-        # Clear terminal and create dashboard
-        os.system('clear' if os.name == 'posix' else 'cls')
-        
-        # Print header with border
-        print(f"\n{Fore.CYAN}╔{'═' * 58}╗{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║ 📈 DMT_v2 PAPER TRADING DASHBOARD - {timestamp} {' ' * (5 - len(timestamp))}║{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        
-        # Print current price and market data
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}📊 MARKET DATA{' ' * 45}{Fore.CYAN}║{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Symbol: {self.symbol} | Price: ${self.current_price:,.2f} | 24h Vol: {self.klines[-1]['volume']:,.1f}{' ' * 5}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print portfolio summary
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.GREEN}💰 PORTFOLIO SUMMARY{' ' * 39}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Create two columns for portfolio data
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Cash: ${self.capital:,.2f}{' ' * (25-len(f'${self.capital:,.2f}'))} | Total Value: ${total_equity:,.2f}{' ' * (16-len(f'${total_equity:,.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Holdings: {self.holdings:.6f} {self.symbol[:3]} (${position_value:,.2f}){' ' * (58-len(f'Holdings: {self.holdings:.6f} {self.symbol[:3]} (${position_value:,.2f})'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print performance metrics
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.MAGENTA}📊 PERFORMANCE METRICS{' ' * 38}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Two columns for performance data
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Initial: ${self.initial_capital:,.2f}{' ' * (20-len(f'${self.initial_capital:,.2f}'))} | P&L: {pl_color}${profit_loss:,.2f} ({profit_loss_pct:+.2f}%){Style.RESET_ALL}{' ' * (20-len(f'${profit_loss:,.2f} ({profit_loss_pct:+.2f}%)'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Best Profit: ${self.best_profit:,.2f}{' ' * (17-len(f'${self.best_profit:,.2f}'))} | Max Drawdown: ${self.worst_drawdown:,.2f}{' ' * (17-len(f'${self.worst_drawdown:,.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print trading stats
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.BLUE}🔄 TRADING ACTIVITY{' ' * 41}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Two columns for trading stats
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Total Trades: {len(self.trades)}{' ' * (20-len(str(len(self.trades))))} | Buy: {buy_count} | Sell: {sell_count}{' ' * (20-len(f'Buy: {buy_count} | Sell: {sell_count}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Add win/loss stats if we have trades
-        if len(self.trades) > 1 and (win_count + loss_count) > 0:
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} Win Rate: {win_rate:.1f}% ({win_count}/{win_count + loss_count}){' ' * (15-len(f'{win_rate:.1f}% ({win_count}/{win_count + loss_count})'))} | Profit Factor: {profit_factor:.2f}{' ' * (15-len(f'{profit_factor:.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} Win Rate: N/A{' ' * 20} | Profit Factor: N/A{' ' * 15}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print strategy info
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.YELLOW}🧠 STRATEGY INFO{' ' * 43}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Format signal with color based on direction
-        signal_color = Fore.GREEN if self.last_signal > 0 else Fore.RED if self.last_signal < 0 else Fore.WHITE
-        signal_str = f"{signal_color}{self.last_signal:.4f}{Style.RESET_ALL}"
-        
-        # Add signal strength indicator
-        signal_strength = abs(self.last_signal)
-        if signal_strength > 0.5:
-            signal_indicator = f"{signal_color}{'▓' * 5}{Style.RESET_ALL}"  # Strong signal
-        elif signal_strength > 0.3:
-            signal_indicator = f"{signal_color}{'▓' * 3}{'░' * 2}{Style.RESET_ALL}"  # Medium signal
-        elif signal_strength > 0.1:
-            signal_indicator = f"{signal_color}{'▓' * 1}{'░' * 4}{Style.RESET_ALL}"  # Weak signal
-        else:
-            signal_indicator = f"{'░' * 5}"  # Neutral
-        
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Version: {self.strategy_version}{' ' * (20-len(self.strategy_version))} | Signal: {signal_str} {signal_indicator}{' ' * (20-len(f'{self.last_signal:.4f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Calculate position size as percentage
-        position_size_pct = (position_value / total_equity) * 100 if total_equity > 0 else 0
-        position_str = f"{position_size_pct:.1f}% of capital"
-        
-        # Add position indicator
-        if position_size_pct > 50:
-            position_indicator = f"{Fore.GREEN}{'▓' * 5}{Style.RESET_ALL}"  # Heavy long
-        elif position_size_pct > 25:
-            position_indicator = f"{Fore.GREEN}{'▓' * 3}{'░' * 2}{Style.RESET_ALL}"  # Medium long
-        elif position_size_pct > 5:
-            position_indicator = f"{Fore.GREEN}{'▓' * 1}{'░' * 4}{Style.RESET_ALL}"  # Light long
-        elif position_size_pct < 1:
-            position_indicator = f"{'░' * 5}"  # No position
-        else:
-            position_indicator = f"{Fore.GREEN}{'░' * 5}{Style.RESET_ALL}"  # Minimal long
-        
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Position: {position_str} {position_indicator}{' ' * (40-len(position_str))}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print recent trades
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.CYAN}📝 RECENT TRADES{' ' * 43}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Show more recent trades (up to 5)
-        recent_trades = self.trades[-5:] if len(self.trades) > 0 else []
-        if recent_trades:
-            for i, trade in enumerate(reversed(recent_trades)):
-                trade_time = trade['timestamp'].strftime('%m-%d %H:%M') if isinstance(trade['timestamp'], datetime) else trade['timestamp']
-                trade_type = trade['type'].upper()
-                trade_color = Fore.GREEN if trade_type == 'BUY' else Fore.RED
-                trade_value = trade['price'] * trade['amount']
-                print(f"{Fore.CYAN}║{Style.RESET_ALL} {trade_color}{trade_time} | {trade_type} {trade['amount']:.6f} @ ${trade['price']:,.2f} (${trade_value:,.2f}){Style.RESET_ALL}{' ' * (10-len(f'${trade_value:,.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} No trades executed yet{' ' * 38}{Fore.CYAN}║{Style.RESET_ALL}")
-        
-        # Print mini charts
-        print(f"{Fore.CYAN}╠{'═' * 58}╣{Style.RESET_ALL}")
-        
-        # Show both price and equity charts side by side if we have enough data
-        if len(self.price_history) > 5:
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.CYAN}📈 PRICE & EQUITY CHARTS{' ' * 36}{Fore.CYAN}║{Style.RESET_ALL}")
-            self._display_mini_charts(self.price_history, self.equity_history)
-        else:
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} {Fore.CYAN}📈 Collecting data for charts...{' ' * 30}{Fore.CYAN}║{Style.RESET_ALL}")
+            # Show recent trades
+            if self.trades:
+                # Get the most recent trade
+                recent_trade = self.trades[-1]
+                trade_time = recent_trade['timestamp'].strftime("%m-%d %H:%M")
+                trade_type = recent_trade['type'].upper()
+                trade_price = recent_trade['price']
+                trade_amount = recent_trade['amount']
+                trade_value = recent_trade['value']
+                
+                print(f"║ {trade_time} | {trade_type} {trade_amount:.6f} @ ${trade_price:.2f} (${trade_value:.2f})║")
+            else:
+                print("║ No trades executed yet                                      ║")
             
-        print(f"{Fore.CYAN}╚{'═' * 58}╝{Style.RESET_ALL}")
+            print("╠══════════════════════════════════════════════════════════╣")
+            print("║ 📈 Collecting data for charts...                              ║")
+            print("╚══════════════════════════════════════════════════════════╝")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error updating status: {e}")
+            return False
+    
+    def _create_visual_indicator(self, value, max_bars=5):
+        """Create a visual indicator bar based on a value from 0 to 1"""
+        # Ensure value is between 0 and 1
+        value = min(max(value, 0), 1)
         
-        # Return the formatted status update
-        return f"Portfolio: ${total_equity:,.2f} | P&L: {profit_loss_pct:+.2f}% | Trades: {len(self.trades)}"
+        # Calculate how many bars to fill
+        filled_bars = int(value * max_bars)
+        empty_bars = max_bars - filled_bars
+        
+        # Create the indicator
+        return '▓' * filled_bars + '░' * empty_bars
     
     def _display_mini_charts(self, price_data, equity_data):
         """Display side-by-side price and equity charts"""
@@ -1151,107 +1234,229 @@ class BinancePaperTrader:
             equity_chart[y][i] = point_char
         
         # Print the charts side by side
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} Price: ${max_price:.2f}{' ' * (15-len(f'${max_price:.2f}'))} | Equity: ${max_equity:.2f}{' ' * (15-len(f'${max_equity:.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
+        print(f"║ 📈 PRICE & EQUITY CHARTS{' ' * 36}║")
         
         for i in range(chart_height):
             price_row = ''.join(price_chart[i])
             equity_row = ''.join(equity_chart[i])
-            print(f"{Fore.CYAN}║{Style.RESET_ALL} {price_row}{' ' * (25-len(price_row))} | {equity_row}{' ' * (25-len(equity_row))}{Fore.CYAN}║{Style.RESET_ALL}")
+            print(f"║ {price_row}{' ' * (25-len(price_row))} | {equity_row}{' ' * (25-len(equity_row))}║")
         
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} ${min_price:.2f}{' ' * (23-len(f'${min_price:.2f}'))} | ${min_equity:.2f}{' ' * (23-len(f'${min_equity:.2f}'))}{Fore.CYAN}║{Style.RESET_ALL}")
+        print(f"║ ${min_price:.2f}{' ' * (23-len(f'${min_price:.2f}'))} | ${min_equity:.2f}{' ' * (23-len(f'${min_equity:.2f}'))}║")
         
         # Print time axis
-        print(f"{Fore.CYAN}║{Style.RESET_ALL} OLD{' ' * 22}NOW | OLD{' ' * 22}NOW{Fore.CYAN}║{Style.RESET_ALL}")
+        print("║ OLD{' ' * 22}NOW | OLD{' ' * 22}NOW║")
+    
+    def _get_24h_volume(self):
+        """Get 24-hour trading volume for the symbol"""
+        try:
+            ticker_24h = self.client.get_ticker(symbol=self.symbol)
+            volume = float(ticker_24h['volume'])
+            return f"{volume:,.1f}"
+        except Exception as e:
+            logging.error(f"Error getting 24h volume: {e}")
+            return "0.0"
+    
+    def _print_final_results(self):
+        """Print final trading results"""
+        try:
+            # Get current price
+            ticker = self.client.get_symbol_ticker(symbol=self.symbol)
+            current_price = float(ticker['price'])
+            
+            # Get portfolio value and profit/loss from simulation account
+            portfolio_value = self.sim_account.get_portfolio_value(current_price)
+            profit_loss, profit_loss_pct = self.sim_account.get_pnl(current_price)
+            
+            # Get trading statistics
+            trade_stats = self.sim_account.get_trade_stats()
+            
+            print("\nFINAL RESULTS:")
+            print(f"Initial Capital: ${self.user_specified_capital:.2f}")
+            print(f"Final Portfolio Value: ${portfolio_value:.2f}")
+            
+            if profit_loss >= 0:
+                print(f"Profit: {Fore.GREEN}+${profit_loss:.2f} (+{profit_loss_pct:.2f}%){Style.RESET_ALL}")
+            else:
+                print(f"Loss: {Fore.RED}-${abs(profit_loss):.2f} ({profit_loss_pct:.2f}%){Style.RESET_ALL}")
+                
+            print(f"Total Trades: {trade_stats['total_trades']}")
+            print(f"Total Fees Paid: ${trade_stats['total_fees']:.2f}")
+            
+            # Print win rate if we have completed trades
+            if trade_stats['win_count'] + trade_stats['loss_count'] > 0:
+                win_rate = (trade_stats['win_count'] / (trade_stats['win_count'] + trade_stats['loss_count'])) * 100
+                print(f"Win Rate: {win_rate:.1f}% ({trade_stats['win_count']}/{trade_stats['win_count'] + trade_stats['loss_count']})")
+            else:
+                print(f"Win Rate: 0.0% (0/{trade_stats['total_trades']})")
+            
+            print(f"\n{Fore.YELLOW}Trading session ended.{Style.RESET_ALL}")
+            
+        except Exception as e:
+            logging.error(f"Error printing final results: {e}")
+            print(f"Error printing final results: {e}")
+    
+    def stop(self):
+        """Stop the trading loop and print final results"""
+        self.running = False
+        print(f"\n{Fore.YELLOW}Trading stopped by user.{Style.RESET_ALL}")
+        
+        # Print final results
+        self._print_final_results()
+    
+    def _reset_positions(self, base_asset: str, base_balance: float):
+        """Reset positions by selling all holdings to start fresh"""
+        if base_balance <= 0 or not self.client:
+            # If no holdings, just reset the simulation account
+            self.sim_account.reset(self.user_specified_capital)
+            self.account_reset = True
+            self.reset_cooldown = True
+            self.reset_time = datetime.now()
+            print(f"🔄 Reset simulation account to ${self.user_specified_capital:.2f}")
+            print(f"⏳ Reset cooldown activated - no trades will be executed for 30 seconds")
+            return True
+            
+        try:
+            # Format quantity according to Binance's precision requirements
+            quantity = self._format_quantity(base_balance)
+            
+            # Execute market sell order to liquidate position
+            order = self.client.create_order(
+                symbol=self.symbol,
+                side='SELL',
+                type='MARKET',
+                quantity=quantity
+            )
+            
+            # Log the trade
+            price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else self.current_price
+            executed_qty = float(order['executedQty']) if 'executedQty' in order else base_balance
+            trade_value = price * executed_qty
+            
+            logging.info(f"RESET: SELL {executed_qty:.8f} {base_asset} at ${price:.2f}")
+            logging.info(f"Trade value: ${trade_value:.2f}")
+            
+            print(f"🔄 Reset position: SELL {executed_qty:.6f} {base_asset} at ${price:.2f}")
+            
+            # Record the trade
+            self.trades.append({
+                'timestamp': datetime.now(),
+                'type': 'reset_sell',
+                'price': price,
+                'amount': executed_qty,
+                'value': trade_value,
+                'order_id': order.get('orderId', 'unknown') if not self.simulation_mode else 'unknown'
+            })
+            
+            # Reset the simulation account to the user-specified initial capital
+            self.sim_account.reset(self.user_specified_capital)
+            
+            # Set the reset cooldown flag and time
+            self.reset_cooldown = True
+            self.reset_time = datetime.now()
+            self.account_reset = True
+            
+            print(f"⏳ Reset cooldown activated - no trades will be executed for 30 seconds")
+            print(f"🔄 Reset simulation account to ${self.user_specified_capital:.2f}")
+            
+            return True
+        except Exception as e:
+            logging.error(f"Error resetting positions: {e}")
+            print(f"⚠️ Error resetting positions: {e}")
+            return False
+    
+    def _get_current_price_with_retry(self, max_retries=3, retry_delay=2):
+        """Get current price with retry logic"""
+        retries = 0
+        while retries < max_retries:
+            try:
+                ticker = self.client.get_symbol_ticker(symbol=self.symbol)
+                return float(ticker['price'])
+            except (BinanceAPIException, BinanceRequestException) as e:
+                logging.error(f"Binance API Error getting price (attempt {retries+1}/{max_retries}): {e}")
+                retries += 1
+                if retries < max_retries:
+                    print(f"⚠️ API error, retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Network error getting price (attempt {retries+1}/{max_retries}): {e}")
+                retries += 1
+                if retries < max_retries:
+                    print(f"⚠️ Network error, retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+            except Exception as e:
+                logging.error(f"Unexpected error getting price: {e}")
+                return None
+        
+        # If we've exhausted all retries, try to estimate the price from the last known price
+        if hasattr(self, 'current_price') and self.current_price > 0:
+            logging.warning(f"Using last known price after {max_retries} failed attempts: ${self.current_price:.2f}")
+            print(f"⚠️ Using last known price: ${self.current_price:.2f}")
+            return self.current_price
+        
+        return None
     
     def run(self, check_interval_seconds: int = 10):
         """
         Run paper trading loop
         
         Args:
-            check_interval_seconds: How often to check for new trading signals
+            check_interval_seconds: Interval between checks in seconds
         """
-        print("\n======================================================")
-        print(f"🚀 Starting DMT_v2 Paper Trading")
-        print(f"📊 Symbol: {self.symbol} | Timeframe: {self.interval}")
-        print(f"💰 Initial Capital: ${self.initial_capital:.2f}")
-        print(f"🔄 Strategy Version: {self.strategy_version}")
-        print(f"💸 Fee Tier: {self.trading_tier} | BNB Discount: {'Yes' if self.use_bnb_for_fees else 'No'}")
-        print(f"🧮 Fee Example: ${self._calculate_fee(10000.0):.2f} on $10000.00 trade ({self._get_fee_rate()*100:.4f}%)")
-        print("======================================================\n")
+        self.running = True
         
-        # Use a faster interval for minute data
-        if self.interval == '1m':
-            check_interval_seconds = min(check_interval_seconds, 3)
-            print(f"📈 Using faster update interval ({check_interval_seconds}s) for 1-minute data\n")
+        # Set up signal handler for clean exit
+        def signal_handler(sig, frame):
+            print("\nReceived interrupt, stopping trading...")
+            self.stop()
             
-        logging.info(f"Starting paper trading for {self.symbol} with {self.initial_capital} USDT")
-        logging.info(f"Strategy: DMT_v2 {self.strategy_version}, Timeframe: {self.interval}")
+        signal.signal(signal.SIGINT, signal_handler)
         
-        # Main trading loop
-        try:
-            while True:
-                # Check for new data
-                new_data = self._check_for_new_data()
+        # Initial status update
+        self._update_status()
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while self.running:
+            try:
+                # Process new data
+                trading_signal = self._calculate_signal()
                 
-                if new_data:
-                    # Process new data
-                    self._process_new_candle(new_data)
-                    
-                    # Calculate signal
-                    signal = self._calculate_signal()
-                    
-                    # Execute trade based on signal
-                    trade_executed = self._execute_trade(signal)
-                    
-                    # Update status
-                    self._update_status()
-                else:
-                    # Update market data
-                    self._update_market_data()
-                    
-                    # Calculate signal
-                    signal = self._calculate_signal()
-                    
-                    # Execute trade based on signal
-                    trade_executed = self._execute_trade(signal)
-                    
-                    # Update status periodically
-                    if datetime.now().second % 30 < 5:  # Update roughly every 30 seconds
-                        self._update_status()
+                # Execute trade based on signal
+                trade_executed = self._execute_trade(trading_signal)
                 
-                # Sleep until next check
+                # Update status
+                self._update_status()
+                
+                # Reset consecutive errors counter on success
+                consecutive_errors = 0
+                
+                # Sleep for the check interval
                 time.sleep(check_interval_seconds)
                 
-        except KeyboardInterrupt:
-            print(f"\n{Fore.YELLOW}Trading stopped by user.{Style.RESET_ALL}")
-            
-            # Show final portfolio value
-            position_value = self.holdings * self.current_price
-            total_equity = self.capital + position_value
-            profit_loss = total_equity - self.initial_capital
-            profit_loss_pct = (profit_loss / self.initial_capital) * 100
-            
-            print(f"\n{Fore.CYAN}FINAL RESULTS:{Style.RESET_ALL}")
-            print(f"Initial Capital: ${self.initial_capital:.2f}")
-            print(f"Final Portfolio Value: ${total_equity:.2f}")
-            
-            if profit_loss >= 0:
-                print(f"Profit: {Fore.GREEN}+${profit_loss:.2f} ({profit_loss_pct:+.2f}%){Style.RESET_ALL}")
-            else:
-                print(f"Loss: {Fore.RED}-${abs(profit_loss):.2f} ({profit_loss_pct:.2f}%){Style.RESET_ALL}")
+            except KeyboardInterrupt:
+                print("\nReceived keyboard interrupt, stopping trading...")
+                self.stop()
+                break
+            except Exception as e:
+                logging.error(f"Error in trading loop: {e}")
+                traceback.print_exc()
                 
-            print(f"Total Trades: {len(self.trades)}")
-            print(f"Total Fees Paid: ${self.total_fees_paid:.2f}")
-            
-            # Calculate trading statistics
-            if len(self.trades) > 0:
-                win_count = sum(1 for t in self.trades if t.get('profit', 0) > 0)
-                loss_count = sum(1 for t in self.trades if t.get('profit', 0) < 0)
-                win_rate = win_count / len(self.trades) * 100 if len(self.trades) > 0 else 0
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"\n⚠️ Too many consecutive errors ({consecutive_errors}), stopping trading...")
+                    self.stop()
+                    break
                 
-                print(f"Win Rate: {win_rate:.1f}% ({win_count}/{len(self.trades)})")
+                # Exponential backoff for retries
+                retry_delay = 2 ** consecutive_errors
+                if retry_delay > 60:
+                    retry_delay = 60  # Cap at 60 seconds
                 
-            print(f"\n{Fore.YELLOW}Trading session ended.{Style.RESET_ALL}")
+                print(f"\n⚠️ Error in trading loop, retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
 
 def main():
     """Main entry point for paper trading script"""
@@ -1276,6 +1481,8 @@ def main():
                       help='Run in full simulation mode without attempting API trades')
     parser.add_argument('--use-binance-us', action='store_true',
                       help='Use Binance US API instead of Binance Global Testnet (not recommended for paper trading)')
+    parser.add_argument('--reset-on-start', action='store_true',
+                      help='Reset positions to start fresh with initial capital')
 
     # Constants and configuration
     API_KEY_ENV_NAME = 'BINANCE_API_KEY_TEST'  # Environment variable for testnet API key
@@ -1319,7 +1526,8 @@ def main():
         use_bnb_for_fees=not args.no_bnb_discount,
         trading_tier=args.trading_tier,
         simulation_mode=args.simulation,
-        use_binance_us=args.use_binance_us
+        use_binance_us=args.use_binance_us,
+        reset_on_start=args.reset_on_start
     )
     
     # Determine check interval based on trading interval
