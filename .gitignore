@@ -29,6 +29,11 @@ wheels/
 data_cache/
 backtest_results/
 
+# Large data files
+*.csv
+data/*.csv
+data/**/*.csv
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
