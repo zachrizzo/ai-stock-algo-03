@@ -105,7 +105,7 @@ class AdvancedFeatureGenerator:
         features['ma50'] = df['Close'].rolling(50).mean() / df['Close'] - 1
         
         # Volatility estimators
-        features['realized_vol'] = df['returns'].rolling(21).std() * np.sqrt(252)
+        features['realized_vol'] = features['returns'].rolling(21).std() * np.sqrt(252)
         features['atr'] = self._calculate_atr(df, 14) / df['Close']
         features['natr'] = talib.NATR(df['High'].values, df['Low'].values, df['Close'].values, timeperiod=14) / 100
         

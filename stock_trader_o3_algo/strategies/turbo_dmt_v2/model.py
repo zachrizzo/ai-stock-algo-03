@@ -427,7 +427,7 @@ class TurboDMTEnsemble:
         
         # Model with larger transformer but smaller LSTM
         config2 = TurboDMTConfig(
-            transformer_dim=self.config.transformer_dim * 1.5,
+            transformer_dim=int(self.config.transformer_dim * 1.5),
             transformer_layers=self.config.transformer_layers + 1,
             lstm_layers=1,
             attention_heads=self.config.attention_heads + 4,
@@ -436,11 +436,14 @@ class TurboDMTEnsemble:
         self.models.append(HybridTransformerLSTM(config2).to(self.device))
         
         # Model with larger LSTM but smaller transformer
+        # Ensure transformer_dim is divisible by attention_heads
+        smaller_dim = int(self.config.transformer_dim * 0.8)
+        smaller_dim = (smaller_dim // self.config.attention_heads) * self.config.attention_heads
         config3 = TurboDMTConfig(
-            transformer_dim=self.config.transformer_dim * 0.8,
-            transformer_layers=self.config.transformer_layers - 1,
+            transformer_dim=smaller_dim,
+            transformer_layers=max(1, self.config.transformer_layers - 1),
             lstm_layers=self.config.lstm_layers + 1,
-            hidden_dim=self.config.hidden_dim * 1.25,
+            hidden_dim=int(self.config.hidden_dim * 1.25),
             dropout=self.config.dropout * 1.2,  # Higher dropout
         )
         self.models.append(HybridTransformerLSTM(config3).to(self.device))
@@ -457,17 +460,20 @@ class TurboDMTEnsemble:
         # Model focused on regime detection
         config5 = TurboDMTConfig(
             transformer_dim=self.config.transformer_dim,
-            hidden_dim=self.config.hidden_dim * 1.5,  # Larger hidden dim
+            hidden_dim=int(self.config.hidden_dim * 1.5),  # Larger hidden dim
             dropout=self.config.dropout,
         )
         self.models.append(HybridTransformerLSTM(config5).to(self.device))
         
         # Model focused on high volatility periods
+        # Ensure transformer_dim is divisible by attention_heads
+        smaller_dim2 = int(self.config.transformer_dim * 0.75)
+        smaller_dim2 = (smaller_dim2 // self.config.attention_heads) * self.config.attention_heads
         config6 = TurboDMTConfig(
-            transformer_dim=self.config.transformer_dim * 0.75,
+            transformer_dim=smaller_dim2,
             transformer_layers=self.config.transformer_layers,
             lstm_layers=self.config.lstm_layers * 2,  # More LSTM layers
-            dropout=self.config.dropout * 1.5,  # Much higher dropout
+            dropout=min(0.5, self.config.dropout * 1.5),  # Much higher dropout
         )
         self.models.append(HybridTransformerLSTM(config6).to(self.device))
         
